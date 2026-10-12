@@ -202,6 +202,11 @@ export type InvenTreeTableProps<T = any> = {
   bulkDeleteFilter?: (record: T) => boolean;
   enableBulkDelete?: boolean;
   enableDownload?: boolean;
+  onDownload?: (params: Record<string, any>) => void;
+  afterDownloadAction?: React.ReactNode;
+  wrapToolbar?: boolean;
+  useUrlFilters?: boolean;
+  onDataLoaded?: (data: any, params: Record<string, any>) => void;
   enableFilters?: boolean;
   enableSelection?: boolean;
   enableSearch?: boolean;

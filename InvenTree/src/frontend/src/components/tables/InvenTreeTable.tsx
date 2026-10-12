@@ -5,17 +5,20 @@ import { ModelInformationDict } from '@lib/enums/ModelInformation';
 import { resolveItem } from '@lib/functions/Conversion';
 import { cancelEvent } from '@lib/functions/Events';
 import { mapFields } from '@lib/functions/Forms';
-import { eventModified, getDetailUrl } from '@lib/functions/Navigation';
-import { navigateToLink } from '@lib/functions/Navigation';
+import {
+  eventModified,
+  getDetailUrl,
+  navigateToLink
+} from '@lib/functions/Navigation';
 import { useStoredTableState } from '@lib/states/StoredTableState';
 import type { TableFilter } from '@lib/types/Filters';
 import type { ApiFormFieldSet } from '@lib/types/Forms';
 import type {
   InvenTreeTableProps,
   InvenTreeTableRenderProps,
+  TableColumn,
   TableState
 } from '@lib/types/Tables';
-import type { TableColumn } from '@lib/types/Tables';
 import { t } from '@lingui/core/macro';
 import { ActionIcon, Box, Stack } from '@mantine/core';
 import { IconArrowRight, IconClick } from '@tabler/icons-react';
@@ -619,6 +622,7 @@ export function InvenTreeTableInternal<T extends Record<string, any>>({
         timeout: 10 * 1000
       })
       .then((response) => {
+        props.onDataLoaded?.(response.data, queryParams);
         let results = response.data?.results ?? response.data ?? [];
 
         if (props.dataFormatter) {
@@ -767,15 +771,7 @@ export function InvenTreeTableInternal<T extends Record<string, any>>({
 
   // Callback when a cell is right-clicked
   const handleCellContextMenu = useCallback(
-    ({
-      record,
-      column,
-      event
-    }: {
-      record: any;
-      column: any;
-      event: any;
-    }) => {
+    ({ record, column, event }: { record: any; column: any; event: any }) => {
       if (column?.noContext === true) {
         return;
       }
@@ -1027,7 +1023,7 @@ export function InvenTreeTable<T extends Record<string, any>>({
       props={props}
       api={api}
       navigate={navigate}
-      searchParams={searchParams}
+      searchParams={props?.useUrlFilters === false ? undefined : searchParams}
       setSearchParams={setSearchParams}
       showContextMenu={showContextMenu}
     />

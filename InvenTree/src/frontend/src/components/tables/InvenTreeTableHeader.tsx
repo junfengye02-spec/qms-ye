@@ -1,7 +1,17 @@
+import { ActionButton } from '@lib/components/ActionButton';
+import { Boundary } from '@lib/components/Boundary';
+import { ButtonMenu } from '@lib/components/ButtonMenu';
+import { SearchInput } from '@lib/components/SearchInput';
+import { StylishText } from '@lib/components/StylishText';
+import { TableColumnSelect } from '@lib/components/TableColumnSelect';
+import { resolveItem } from '@lib/functions/Conversion';
+import type { TableFilter } from '@lib/types/Filters';
+import type { InvenTreeTableProps, TableState } from '@lib/types/Tables';
 import { t } from '@lingui/core/macro';
 import {
   ActionIcon,
   Alert,
+  Button,
   Divider,
   Group,
   HoverCard,
@@ -12,6 +22,7 @@ import {
   Text,
   Tooltip
 } from '@mantine/core';
+import { showNotification } from '@mantine/notifications';
 import {
   IconBarcode,
   IconDownload,
@@ -22,18 +33,6 @@ import {
 } from '@tabler/icons-react';
 import { useMemo, useState } from 'react';
 import { Fragment } from 'react/jsx-runtime';
-
-import { ActionButton } from '@lib/components/ActionButton';
-import { Boundary } from '@lib/components/Boundary';
-import { ButtonMenu } from '@lib/components/ButtonMenu';
-import { SearchInput } from '@lib/components/SearchInput';
-import { StylishText } from '@lib/components/StylishText';
-import { TableColumnSelect } from '@lib/components/TableColumnSelect';
-import { resolveItem } from '@lib/functions/Conversion';
-import type { TableFilter } from '@lib/types/Filters';
-import type { TableState } from '@lib/types/Tables';
-import type { InvenTreeTableProps } from '@lib/types/Tables';
-import { showNotification } from '@mantine/notifications';
 import useDataExport from '../../hooks/UseDataExport';
 import { useDeleteApiFormModal } from '../../hooks/UseForm';
 import { PrintingActions } from '../buttons/PrintingActions';
@@ -78,7 +77,7 @@ export default function InvenTreeTableHeader({
     }
 
     // Add in active filters
-    if (tableState.filterSet.activeFilters) {
+    if (!queryFilters?.size && tableState.filterSet.activeFilters) {
       tableState.filterSet.activeFilters.forEach((filter) => {
         filters[filter.name] = filter.value;
       });
@@ -195,6 +194,17 @@ export default function InvenTreeTableHeader({
     );
   }, [tableProps.printingAccessor, tableState.selectedRecords]);
 
+  const selectedCount = tableState.selectedRecords.length;
+  const selectedOutsidePage = useMemo(() => {
+    const accessor = tableState.idAccessor || 'pk';
+    const visibleIds = new Set(
+      tableState.records.map((record) => resolveItem(record, accessor))
+    );
+    return tableState.selectedRecords.filter(
+      (record) => !visibleIds.has(resolveItem(record, accessor))
+    ).length;
+  }, [tableState.idAccessor, tableState.records, tableState.selectedRecords]);
+
   return (
     <>
       {exportModal.modal}
@@ -217,8 +227,38 @@ export default function InvenTreeTableHeader({
           onClose={() => clearQueryFilters()}
         />
       )}
-      <Group justify='apart' grow wrap='nowrap'>
-        <Group justify='left' key='custom-actions' gap={5} wrap='nowrap'>
+      {tableProps.enableSelection && (
+        <Group gap='xs' aria-label='table-selection-summary'>
+          <Text size='sm' aria-live='polite'>
+            {t`Selected: ${selectedCount}`}
+          </Text>
+          {selectedOutsidePage > 0 && (
+            <Text size='sm' c='orange'>
+              {t`${selectedOutsidePage} selected items are not on this page`}
+            </Text>
+          )}
+          <Button
+            size='compact-xs'
+            variant='subtle'
+            aria-label='table-clear-selection'
+            disabled={selectedCount === 0}
+            onClick={tableState.clearSelectedRecords}
+          >
+            {t`Clear selection`}
+          </Button>
+        </Group>
+      )}
+      <Group
+        justify='space-between'
+        grow={!tableProps.wrapToolbar}
+        wrap={tableProps.wrapToolbar ? 'wrap' : 'nowrap'}
+      >
+        <Group
+          justify='left'
+          key='custom-actions'
+          gap={5}
+          wrap={tableProps.wrapToolbar ? 'wrap' : 'nowrap'}
+        >
           <PrintingActions
             items={printingIdValues}
             modelType={tableProps.modelType}
@@ -249,8 +289,12 @@ export default function InvenTreeTableHeader({
             <Fragment key={idx}>{group}</Fragment>
           ))}
         </Group>
-        <Space />
-        <Group justify='right' gap={5} wrap='nowrap'>
+        {!tableProps.wrapToolbar && <Space />}
+        <Group
+          justify='right'
+          gap={5}
+          wrap={tableProps.wrapToolbar ? 'wrap' : 'nowrap'}
+        >
           {tableProps.enableSearch && (
             <SearchInput
               disabled={hasCustomSearch}
@@ -324,13 +368,27 @@ export default function InvenTreeTableHeader({
               </ActionIcon>
             </Indicator>
           )}
-          {tableUrl && tableProps.enableDownload && (
-            <ActionIcon variant='transparent' aria-label='table-export-data'>
-              <Tooltip label={t`Export data`} position='top-end'>
-                <IconDownload onClick={exportModal.open} />
-              </Tooltip>
-            </ActionIcon>
-          )}
+          <Group gap={5} wrap='nowrap'>
+            {tableUrl && tableProps.enableDownload && (
+              <ActionIcon
+                variant='transparent'
+                aria-label='table-export-data'
+                onClick={() =>
+                  tableProps.onDownload
+                    ? tableProps.onDownload({
+                        ...exportFilters,
+                        search: tableState.searchTerm
+                      })
+                    : exportModal.open()
+                }
+              >
+                <Tooltip label={t`Export data`} position='top-end'>
+                  <IconDownload />
+                </Tooltip>
+              </ActionIcon>
+            )}
+            {tableProps.afterDownloadAction}
+          </Group>
         </Group>
       </Group>
     </>
