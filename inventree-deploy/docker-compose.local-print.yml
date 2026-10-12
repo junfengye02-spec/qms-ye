@@ -1,0 +1,19 @@
+# Optional overlay. Configure verified certificate files before using this file.
+# docker compose -f docker-compose.yml -f docker-compose.local-print.yml up -d
+services:
+  inventree-server:
+    environment:
+      INVENTREE_LOCAL_PRINT_ENABLED: ${INVENTREE_LOCAL_PRINT_ENABLED:-False}
+      INVENTREE_LOCAL_PRINT_QZ_VERSION: ${INVENTREE_LOCAL_PRINT_QZ_VERSION:-2.2.5}
+      INVENTREE_LOCAL_PRINT_DOWNLOAD_URL: ${INVENTREE_LOCAL_PRINT_DOWNLOAD_URL:-}
+      INVENTREE_LOCAL_PRINT_CERTIFICATE: /run/secrets/local_print_certificate
+      INVENTREE_LOCAL_PRINT_PRIVATE_KEY: /run/secrets/local_print_private_key
+    secrets:
+      - local_print_certificate
+      - local_print_private_key
+
+secrets:
+  local_print_certificate:
+    file: ${WMS_LOCAL_PRINT_CERTIFICATE_FILE:?Set an absolute path to the public signing certificate}
+  local_print_private_key:
+    file: ${WMS_LOCAL_PRINT_PRIVATE_KEY_FILE:?Set an absolute path to the server-only RSA private key}

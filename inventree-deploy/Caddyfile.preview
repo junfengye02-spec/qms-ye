@@ -1,0 +1,36 @@
+{
+	default_sni {$WMS_PREVIEW_HOST:172.16.130.22}
+	auto_https disable_redirects
+}
+
+(wms-preview-app) {
+	handle_path /local-print-setup/* {
+		root * /var/www/ca/local-print-setup
+		header Cache-Control "no-store"
+		file_server
+	}
+	handle /wms-ca.crt {
+		root * /var/www/ca
+		header Content-Type application/x-x509-ca-cert
+		header Content-Disposition "attachment; filename=wms-ca.crt"
+		file_server
+	}
+	handle_path /media/* {
+		forward_auth http://wms-preview:8000 {
+			uri /auth/
+		}
+		root * /var/www/media
+		header Content-Disposition attachment
+		file_server
+	}
+	reverse_proxy http://wms-preview:8000
+}
+
+:8000 {
+	import wms-preview-app
+}
+
+https://{$WMS_PREVIEW_HOST:172.16.130.22}:8443, https://localhost:8443, https://127.0.0.1:8443 {
+	tls internal
+	import wms-preview-app
+}
