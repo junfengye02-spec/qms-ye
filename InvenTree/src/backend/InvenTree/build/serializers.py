@@ -951,10 +951,13 @@ class BuildAllocationItemSerializer(serializers.Serializer):
 
         # Check that the quantity does not exceed the available amount from the stock item
         allocated = self.context.get('_stock_item_allocated')
+        frozen = self.context.get('_stock_item_frozen')
 
         if allocated is not None:
             q = max(
-                stock_item.quantity - allocated.get(stock_item.pk, Decimal(0)),
+                stock_item.quantity
+                - allocated.get(stock_item.pk, Decimal(0))
+                - (frozen or {}).get(stock_item.pk, Decimal(0)),
                 Decimal(0),
             )
         else:
@@ -1016,6 +1019,9 @@ class BuildAllocationSerializer(BulkPrefetchSerializerMixin, serializers.Seriali
         """
         stock_items = self.context.get('_stock_item', {}).values()
         self.context['_stock_item_allocated'] = StockItem.bulk_allocation_count(
+            stock_items
+        )
+        self.context['_stock_item_frozen'] = StockItem.bulk_scan_frozen_quantity(
             stock_items
         )
 

@@ -702,6 +702,15 @@ class Build(
             .order_by('pk')
             .values_list('pk', 'quantity')
         )
+        locked_stock_items = {
+            item.stock_item_id: item.stock_item for item in build_items
+        }
+        remaining_allocated = stock.models.StockItem.bulk_allocation_count(
+            locked_stock_items.values()
+        )
+        frozen_quantities = stock.models.StockItem.bulk_scan_frozen_quantity(
+            locked_stock_items.values()
+        )
 
         split_items = []  # (source_item, new_item, quantity) - stock to split off
         install_items = []  # (build_item, target_item, output, quantity) - stock to install
@@ -739,10 +748,25 @@ class Build(
                 # Avoid float -> Decimal precision artifacts (e.g. Decimal(0.1))
                 quantity = decimal.Decimal(str(quantity))
 
+            # This completion releases its own BuildItem allocation in the same
+            # transaction. Protect all other native allocations and every scan
+            # freeze while calculating how much of this allocation can be consumed.
+            other_allocated = max(
+                remaining_allocated.get(stock_item.pk, decimal.Decimal(0))
+                - build_item.quantity,
+                decimal.Decimal(0),
+            )
+            consumable = max(
+                stock_item.quantity
+                - other_allocated
+                - frozen_quantities.get(stock_item.pk, decimal.Decimal(0)),
+                decimal.Decimal(0),
+            )
+
             # Clamp to the maximum quantity available for this build item and stock item
             quantity = max(
                 decimal.Decimal(0),
-                min(quantity, build_item.quantity, stock_item.quantity),
+                min(quantity, build_item.quantity, consumable),
             )
 
             if quantity <= 0:
@@ -790,6 +814,10 @@ class Build(
             _item = seen_build_items.get(build_item.pk) or build_item
             _item.quantity = max(decimal.Decimal(0), _item.quantity - quantity)
             seen_build_items[build_item.pk] = _item
+            remaining_allocated[stock_item.pk] = max(
+                remaining_allocated.get(stock_item.pk, decimal.Decimal(0)) - quantity,
+                decimal.Decimal(0),
+            )
 
             # If the total item quantity is now zero, we can remove the build item from the database
             if _item.quantity <= 0:
@@ -828,6 +856,7 @@ class Build(
                     part_id=new_item.part_id,
                     tracking_type=StockHistoryCode.SPLIT_FROM_PARENT.value,
                     user=user,
+                    **users.models.operator_snapshot(user),
                     notes=notes,
                     deltas={'stockitem': source_item.pk, 'quantity': float(quantity)},
                 )
@@ -838,6 +867,7 @@ class Build(
                     part_id=source_item.part_id,
                     tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
                     user=user,
+                    **users.models.operator_snapshot(user),
                     notes=notes,
                     deltas={
                         'removed': float(quantity),
@@ -856,6 +886,7 @@ class Build(
                     part_id=target_item.part_id,
                     tracking_type=StockHistoryCode.INSTALLED_INTO_ASSEMBLY.value,
                     user=user,
+                    **users.models.operator_snapshot(user),
                     notes=notes,
                     deltas={
                         'stockitem': output.pk,
@@ -870,6 +901,7 @@ class Build(
                     part_id=output.part_id,
                     tracking_type=StockHistoryCode.INSTALLED_CHILD_ITEM.value,
                     user=user,
+                    **users.models.operator_snapshot(user),
                     notes=notes,
                     deltas={'stockitem': target_item.pk, 'quantity': float(quantity)},
                 )
@@ -891,6 +923,7 @@ class Build(
                     part_id=target_item.part_id,
                     tracking_type=StockHistoryCode.BUILD_CONSUMED.value,
                     user=user,
+                    **users.models.operator_snapshot(user),
                     notes=notes,
                     deltas={'buildorder': self.pk, 'quantity': float(quantity)},
                 )
@@ -1660,13 +1693,18 @@ class Build(
         allocated_quantities = stock.models.StockItem.bulk_allocation_count(
             stock_items.values()
         )
+        frozen_quantities = stock.models.StockItem.bulk_scan_frozen_quantity(
+            stock_items.values()
+        )
 
         for pk in pks:
             stock_item = stock_items[pk]
             stock_item.quantity = locked_quantities[pk]
 
             available = max(
-                stock_item.quantity - allocated_quantities.get(pk, decimal.Decimal(0)),
+                stock_item.quantity
+                - allocated_quantities.get(pk, decimal.Decimal(0))
+                - frozen_quantities.get(pk, decimal.Decimal(0)),
                 decimal.Decimal(0),
             )
 
@@ -1961,6 +1999,9 @@ class Build(
         allocated_by_pk = stock.models.StockItem.bulk_allocation_count(
             candidate_stock.values()
         )
+        frozen_by_pk = stock.models.StockItem.bulk_scan_frozen_quantity(
+            candidate_stock.values()
+        )
 
         new_items = []
 
@@ -1970,7 +2011,10 @@ class Build(
             for stock_item in available_stock:
                 # How much of the stock item is "available" for allocation?
                 stock_unallocated = max(
-                    stock_item.quantity - allocated_by_pk.get(stock_item.pk, 0), 0
+                    stock_item.quantity
+                    - allocated_by_pk.get(stock_item.pk, 0)
+                    - frozen_by_pk.get(stock_item.pk, 0),
+                    0,
                 )
                 quantity = min(unallocated_quantity, stock_unallocated)
 
@@ -2478,8 +2522,18 @@ class BuildItem(InvenTree.models.InvenTreeMetadataModel):
         sales_allocation_count = decimal.Decimal(
             self.stock_item.sales_order_allocation_count()
         )
+        transfer_allocation_count = decimal.Decimal(
+            self.stock_item.transfer_order_allocation_count()
+        )
+        scan_frozen = self.stock_item.scan_frozen_quantity()
 
-        total_allocation = build_allocation_count + sales_allocation_count + quantity
+        total_allocation = (
+            build_allocation_count
+            + sales_allocation_count
+            + transfer_allocation_count
+            + scan_frozen
+            + quantity
+        )
 
         if total_allocation > available:
             error = {'quantity': _('Stock item is over-allocated')}

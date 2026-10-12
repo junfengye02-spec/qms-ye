@@ -192,6 +192,14 @@ class BarcodeAPITest(InvenTreeAPITestCase):
 
         self.assignRole('stock.change')
 
+        part_ipn = Part.objects.exclude(IPN__isnull=True).exclude(IPN='').first().IPN
+        response = self.post(
+            self.assign_url,
+            data={'barcode': part_ipn, 'stockitem': item.pk},
+            expected_code=400,
+        )
+        self.assertIn('error', response.data)
+
         self.assertEqual(len(item.barcode_hash), 0)
 
         barcode_data = 'A-TEST-BARCODE-STRING'

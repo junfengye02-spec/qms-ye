@@ -140,6 +140,23 @@ def default_uuid4() -> str:
     return str(uuid.uuid4())
 
 
+def prevent_disabling_active_scan_approval(setting):
+    """Reject disabling approval while requests still reserve inventory."""
+    if setting.as_bool():
+        return
+
+    from stock.models import ScanStockApprovalRequest
+
+    if ScanStockApprovalRequest.objects.filter(
+        status__in=ScanStockApprovalRequest.active_statuses()
+    ).exists():
+        raise ValidationError({
+            'value': _(
+                'Scan approval cannot be disabled while active requests exist'
+            )
+        })
+
+
 class BaseURLValidator(URLValidator):
     """Validator for the InvenTree base URL.
 
@@ -429,12 +446,6 @@ SYSTEM_SETTINGS: dict[str, InvenTreeSettingsKeyType] = {
     'PART_IPN_REGEX': {
         'name': _('IPN Regex'),
         'description': _('Regular expression pattern for matching Part IPN'),
-    },
-    'PART_ALLOW_DUPLICATE_IPN': {
-        'name': _('Allow Duplicate IPN'),
-        'description': _('Allow multiple parts to share the same IPN'),
-        'default': True,
-        'validator': bool,
     },
     'PART_ALLOW_EDIT_IPN': {
         'name': _('Allow Editing IPN'),
@@ -800,6 +811,35 @@ SYSTEM_SETTINGS: dict[str, InvenTreeSettingsKeyType] = {
         ),
         'default': False,
         'validator': bool,
+    },
+    'SCAN_APPROVAL_ENABLED': {
+        'name': _('Scan Stock Approval'),
+        'description': _(
+            'Require server-side approval requests for direct inbound and outbound scans'
+        ),
+        'default': False,
+        'validator': bool,
+        'before_save': prevent_disabling_active_scan_approval,
+    },
+    'SCAN_APPROVAL_DRAFT_TIMEOUT_MINUTES': {
+        'name': _('Scan Approval Draft Timeout'),
+        'description': _('Minutes before an inactive scan approval draft expires'),
+        'default': 30,
+        'units': _('minutes'),
+        'validator': [int, MinValueValidator(5), MaxValueValidator(1440)],
+    },
+    'SCAN_APPROVAL_PENDING_TIMEOUT_MINUTES': {
+        'name': _('Scan Approval Pending Timeout'),
+        'description': _('Minutes before a submitted scan request expires'),
+        'default': 1440,
+        'units': _('minutes'),
+        'validator': [int, MinValueValidator(10), MaxValueValidator(10080)],
+    },
+    'SCAN_APPROVAL_MAX_LINES': {
+        'name': _('Scan Approval Maximum Lines'),
+        'description': _('Maximum number of physical scan events in one request'),
+        'default': 100,
+        'validator': [int, MinValueValidator(1), MaxValueValidator(500)],
     },
     'BUILDORDER_REFERENCE_PATTERN': {
         'name': _('Build Order Reference Pattern'),

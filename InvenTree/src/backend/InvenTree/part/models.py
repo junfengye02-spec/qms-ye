@@ -531,7 +531,12 @@ class Part(
         verbose_name_plural = _('Parts')
         ordering = ['name']
         constraints = [
-            UniqueConstraint(fields=['name', 'IPN', 'revision'], name='unique_part')
+            UniqueConstraint(fields=['name', 'IPN', 'revision'], name='unique_part'),
+            UniqueConstraint(
+                fields=['barcode_hash'],
+                condition=~Q(barcode_hash=''),
+                name='part_barcode_hash_unique',
+            ),
         ]
 
     class MPTTMeta:
@@ -613,6 +618,12 @@ class Part(
         if self.pk:
             try:
                 previous = Part.objects.get(pk=self.pk)
+
+                if (previous.IPN != self.IPN or previous.units != self.units) and (
+                    self.stock_items.exists() or self.scan_stock_events.exists()
+                    or self.stock_tracking_info.exists()
+                ):
+                    raise ValidationError({'IPN': _('有业务记录的设备不能修改设备ID或单位')})
 
                 # Image has been changed
                 if previous.image is not None and self.image != previous.image:
@@ -1027,11 +1038,8 @@ class Part(
         """
         super().validate_unique(exclude)
 
-        # User can decide whether duplicate IPN (Internal Part Number) values are allowed
-        allow_duplicate_ipn = get_global_setting('PART_ALLOW_DUPLICATE_IPN')
-
-        # Raise an error if an IPN is set, and it is a duplicate
-        if self.IPN and not allow_duplicate_ipn:
+        # IPN is the company-wide product scan code and must be unique.
+        if self.IPN:
             parts = Part.objects.filter(IPN__iexact=self.IPN)
             parts = parts.exclude(pk=self.pk)
 
@@ -1095,6 +1103,8 @@ class Part(
         # Strip IPN field
         if type(self.IPN) is str:
             self.IPN = self.IPN.strip()
+
+        self.ipn_hash = InvenTree.helpers.hash_part_ipn(self.IPN)
 
         # Run custom validation for the IPN field
         self.validate_ipn()
@@ -1167,6 +1177,16 @@ class Part(
         null=True,
         verbose_name=_('IPN'),
         help_text=_('Internal Part Number'),
+    )
+
+    ipn_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        editable=False,
+        verbose_name=_('IPN Hash'),
+        help_text=_('Canonical hash used to enforce unique IPN values'),
     )
 
     revision = models.CharField(
@@ -1259,6 +1279,10 @@ class Part(
         verbose_name=_('Maximum Stock'),
         help_text=_('Maximum allowed stock level'),
     )
+
+    brand = models.CharField(max_length=100, blank=True)
+    model_number = models.CharField(max_length=100, blank=True)
+    specification = models.CharField(max_length=250, blank=True)
 
     units = models.CharField(
         max_length=20,

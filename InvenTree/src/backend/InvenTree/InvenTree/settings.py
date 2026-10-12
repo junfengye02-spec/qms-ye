@@ -90,6 +90,30 @@ config.load_version_file()
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = get_boolean_setting('INVENTREE_DEBUG', 'debug', False)
 
+# Local label printing remains opt-in until Windows pilot acceptance.
+LOCAL_PRINT_ENABLED = get_boolean_setting(
+    'INVENTREE_LOCAL_PRINT_ENABLED', 'local_print.enabled', False
+)
+LOCAL_PRINT_CERTIFICATE = get_setting(
+    'INVENTREE_LOCAL_PRINT_CERTIFICATE', 'local_print.certificate', ''
+)
+LOCAL_PRINT_PRIVATE_KEY = get_setting(
+    'INVENTREE_LOCAL_PRINT_PRIVATE_KEY', 'local_print.private_key', ''
+)
+LOCAL_PRINT_DOWNLOAD_URL = get_setting(
+    'INVENTREE_LOCAL_PRINT_DOWNLOAD_URL', 'local_print.download_url', ''
+)
+LOCAL_PRINT_QZ_VERSION = get_setting(
+    'INVENTREE_LOCAL_PRINT_QZ_VERSION', 'local_print.qz_version', '2.2.5'
+)
+# Full task-bound base64 signing requests are bounded to an 8 MiB PDF.
+DATA_UPLOAD_MAX_MEMORY_SIZE = get_setting(
+    'INVENTREE_DATA_UPLOAD_MAX_MEMORY_SIZE',
+    'data_upload_max_memory_size',
+    12 * 1024 * 1024 if LOCAL_PRINT_ENABLED else 2621440,
+    typecast=int,
+)
+
 # Internal flag to determine if we are running in docker mode
 DOCKER = get_boolean_setting('INVENTREE_DOCKER', default_value=False)
 

@@ -168,7 +168,7 @@ class ProjectCode(InvenTree.models.InvenTreeMetadataModel):
         return self.code
 
     code = models.CharField(
-        max_length=50,
+        max_length=100,
         unique=True,
         verbose_name=_('Project Code'),
         help_text=_('Unique project code'),
@@ -196,6 +196,33 @@ class ProjectCode(InvenTree.models.InvenTreeMetadataModel):
         help_text=_('User or group responsible for this project'),
         related_name='project_codes',
     )
+
+    def clean(self):
+        """Keep one canonical code and protect identities referenced by warehouse records."""
+        super().clean()
+        self.code = self.code.strip()
+        if not self.code:
+            raise ValidationError({'code': _('Project code is required')})
+        if self.pk:
+            previous = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values_list('code', flat=True)
+                .first()
+            )
+            if previous != self.code and (
+                self.wms_receipts.exists()
+                or self.wms_details.exists()
+                or self.wms_stock_items.exists()
+            ):
+                raise ValidationError(
+                    {'code': _('A referenced project code cannot be renamed')}
+                )
+
+    def save(self, *args, **kwargs):
+        """Normalize before the database enforces project-code uniqueness."""
+        self.clean()
+        return super().save(*args, **kwargs)
 
 
 class BaseInvenTreeSetting(models.Model):
@@ -907,9 +934,9 @@ class BaseInvenTreeSetting(models.Model):
             except ValidationError as e:
                 raise e
             except Exception:
-                raise ValidationError({
-                    'value': _('Value does not pass validation checks')
-                })
+                raise ValidationError(
+                    {'value': _('Value does not pass validation checks')}
+                )
 
     def validate_unique(self, exclude=None):
         """Ensure that the key:value pair is unique. In addition to the base validators, this ensures that the 'key' is unique, using a case-insensitive comparison.
@@ -2017,10 +2044,9 @@ class Attachment(
 
         # Either 'attachment' or 'link' must be specified!
         if not self.attachment and not self.link:
-            raise ValidationError({
-                'attachment': _('Missing file'),
-                'link': _('Missing external link'),
-            })
+            raise ValidationError(
+                {'attachment': _('Missing file'), 'link': _('Missing external link')}
+            )
 
         if self.attachment:
             if self.attachment.name.lower().endswith('.svg'):
@@ -2383,30 +2409,36 @@ class InvenTreeCustomUserStateModel(models.Model):
         status_class = self.get_status_class()
 
         if not status_class:
-            raise ValidationError({
-                'reference_status': _('Valid reference status class must be provided')
-            })
+            raise ValidationError(
+                {'reference_status': _('Valid reference status class must be provided')}
+            )
 
         if self.key in status_class.values():
-            raise ValidationError({
-                'key': _(
-                    'Key must be different from the logical keys of the reference status'
-                )
-            })
+            raise ValidationError(
+                {
+                    'key': _(
+                        'Key must be different from the logical keys of the reference status'
+                    )
+                }
+            )
 
         if self.logical_key not in status_class.values():
-            raise ValidationError({
-                'logical_key': _(
-                    'Logical key must be in the logical keys of the reference status'
-                )
-            })
+            raise ValidationError(
+                {
+                    'logical_key': _(
+                        'Logical key must be in the logical keys of the reference status'
+                    )
+                }
+            )
 
         if self.name in status_class.names():
-            raise ValidationError({
-                'name': _(
-                    'Name must be different from the names of the reference status'
-                )
-            })
+            raise ValidationError(
+                {
+                    'name': _(
+                        'Name must be different from the names of the reference status'
+                    )
+                }
+            )
 
         return super().clean()
 
@@ -2689,14 +2721,14 @@ class ParameterTemplate(
         # Check that checkbox parameters do not have units or choices
         if self.checkbox:
             if self.units:
-                raise ValidationError({
-                    'units': _('Checkbox parameters cannot have units')
-                })
+                raise ValidationError(
+                    {'units': _('Checkbox parameters cannot have units')}
+                )
 
             if self.choices:
-                raise ValidationError({
-                    'choices': _('Checkbox parameters cannot have choices')
-                })
+                raise ValidationError(
+                    {'choices': _('Checkbox parameters cannot have choices')}
+                )
 
         # Check that 'choices' are in fact valid
         if self.choices is None:

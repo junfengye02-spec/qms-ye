@@ -5,8 +5,21 @@ from decimal import Decimal
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import BooleanField, Case, Count, Prefetch, Q, Value, When
-from django.db.models.functions import Coalesce
+from django.db.models import (
+    BooleanField,
+    Case,
+    Count,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+    When,
+)
+from django.db.models import DecimalField as ModelDecimalField
+from django.db.models.functions import Coalesce, Greatest
 from django.utils.translation import gettext_lazy as _
 
 import structlog
@@ -29,6 +42,7 @@ import part.serializers as part_serializers
 import stock.filters
 import stock.status_codes
 from common.settings import get_global_setting
+from data_exporter.mixins import DataExportSerializerMixin
 from generic.states.fields import InvenTreeCustomStatusSerializerMixin
 from importer.registry import register_importer
 from InvenTree.fields import PrefetchedPrimaryKeyRelatedField
@@ -41,10 +55,14 @@ from InvenTree.serializers import (
     TreePathSerializer,
 )
 from InvenTree.tasks import batch_offload_tasks
+from order.status_codes import SalesOrderStatusGroups, TransferOrderStatusGroups
 from plugin.base.event.events import batch_events
+from users.models import operator_snapshot
 from users.serializers import UserSerializer
 
 from .models import (
+    ScanStockApprovalRequest,
+    ScanStockEvent,
     StockItem,
     StockItemTestResult,
     StockItemTracking,
@@ -54,6 +72,459 @@ from .models import (
 )
 
 logger = structlog.get_logger('inventree')
+
+
+class ScanInboundPartCreateSerializer(serializers.Serializer):
+    """Minimal product details required to register an unknown scanned IPN."""
+
+    name = serializers.CharField(
+        max_length=100,
+        allow_blank=False,
+        label=_('Name'),
+        help_text=_('Product name shown throughout InvenTree'),
+    )
+    IPN = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=False,
+        write_only=True,
+        help_text=_('Must match the scanned product code'),
+    )
+    description = serializers.CharField(
+        max_length=250,
+        required=False,
+        allow_blank=True,
+        label=_('Description'),
+        help_text=_('Optional product description'),
+    )
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=part_models.PartCategory.objects.filter(structural=False),
+        required=True,
+        allow_null=False,
+        label=_('Category'),
+    )
+    units = serializers.CharField(max_length=20, allow_blank=False)
+    brand = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    model_number = serializers.CharField(
+        max_length=100, required=False, allow_blank=True
+    )
+    specification = serializers.CharField(
+        max_length=250, required=False, allow_blank=True
+    )
+    default_location = serializers.PrimaryKeyRelatedField(
+        queryset=StockLocation.objects.filter(structural=False),
+        required=True,
+        allow_null=False,
+        label=_('Default Location'),
+        help_text=_('Stock location used for this and future scan inbound operations'),
+    )
+
+
+class ScanStockRequestSerializer(serializers.Serializer):
+    """Validate a shared inbound or outbound stock scan envelope."""
+
+    barcode = serializers.CharField(
+        max_length=2000, trim_whitespace=False, allow_blank=False
+    )
+    client_event_id = serializers.UUIDField()
+    approval_request_id = serializers.IntegerField(required=False, min_value=1)
+    receipt_id = serializers.IntegerField(required=False, min_value=1)
+    quantity_confirmed = serializers.BooleanField(required=False, default=False)
+    quantity = InvenTreeDecimalField(min_value=Decimal('0.00001'), default=1)
+    source_location = serializers.PrimaryKeyRelatedField(
+        queryset=StockLocation.objects.filter(structural=False),
+        required=False,
+        allow_null=False,
+    )
+    destination_location = serializers.PrimaryKeyRelatedField(
+        queryset=StockLocation.objects.filter(structural=False),
+        required=False,
+        allow_null=False,
+    )
+    stock_item_id = serializers.IntegerField(required=False, min_value=1)
+    create_stock_item = serializers.BooleanField(required=False, default=False)
+    batch = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, allow_null=True
+    )
+    project_number = serializers.CharField(
+        max_length=100, required=False, allow_blank=False
+    )
+    project_id = serializers.IntegerField(min_value=1, required=False)
+    purpose = serializers.CharField(max_length=250, required=False, allow_blank=True)
+    remark = serializers.CharField(max_length=2000, required=False, allow_blank=True)
+    status = serializers.IntegerField(required=False)
+    packaging = serializers.CharField(
+        max_length=50, required=False, allow_blank=True, allow_null=True
+    )
+    supplier_part = serializers.PrimaryKeyRelatedField(
+        queryset=company.models.SupplierPart.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    expiry_date = serializers.DateField(required=False, allow_null=True)
+    create_part = ScanInboundPartCreateSerializer(required=False, write_only=True)
+    device_id = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    session_id = serializers.CharField(max_length=255, required=False, allow_blank=True)
+
+    def validate_barcode(self, barcode: str) -> str:
+        """Reject empty scanner payloads and trim scanner terminator whitespace."""
+        if not barcode.strip():
+            raise ValidationError(_('Barcode must not be empty'))
+        return barcode.strip()
+
+    def validate_status(self, value: int) -> int:
+        """Accept only configured logical or custom stock status values."""
+        if value not in stock.status_codes.StockStatus.keys(custom=True):
+            raise ValidationError(_('Invalid stock status code'))
+        return value
+
+    def validate(self, attrs):
+        """Require one explicit location matching the endpoint direction."""
+        attrs = super().validate(attrs)
+        operation = self.context['operation']
+        project = attrs.pop('project_number', None)
+        if project is not None:
+            if 'batch' in attrs and attrs['batch'] != project:
+                raise ValidationError({'project_number': _('项目与batch不一致')})
+            attrs['batch'] = project
+        if 'project_id' in attrs:
+            from stock.projects import selected_project
+
+            selected = selected_project(
+                {
+                    'project_id': attrs['project_id'],
+                    **({'project': attrs['batch']} if attrs.get('batch') else {}),
+                },
+                allow_inactive=operation == ScanStockEvent.Operation.OUTBOUND,
+            )
+            attrs['batch'] = selected.code
+        if not attrs.get('batch') and not attrs['barcode'].startswith('WMS1:'):
+            raise ValidationError({'batch': _('项目必填')})
+        if operation == ScanStockEvent.Operation.OUTBOUND and not attrs.get('purpose'):
+            raise ValidationError({'purpose': _('出库用途必填')})
+
+        if attrs.get('stock_item_id') and attrs.get('create_stock_item'):
+            raise ValidationError(
+                _('Select an existing stock item or create a new one, not both')
+            )
+
+        if operation == ScanStockEvent.Operation.INBOUND:
+            if not attrs.get('destination_location'):
+                raise ValidationError(
+                    {'destination_location': _('Destination location is required')}
+                )
+            if attrs.get('source_location'):
+                raise ValidationError(
+                    {
+                        'source_location': _(
+                            'Source location is not valid for inbound scans'
+                        )
+                    }
+                )
+            create_part = attrs.get('create_part')
+            if create_part and create_part.get('IPN'):
+                if create_part['IPN'].casefold() != attrs['barcode'].casefold():
+                    raise ValidationError(
+                        {'create_part': _('IPN must match the scanned product code')}
+                    )
+            if (
+                create_part
+                and create_part.get('default_location')
+                and create_part['default_location'] != attrs['destination_location']
+            ):
+                raise ValidationError(
+                    {
+                        'create_part': _(
+                            'Product default location must match the inbound destination'
+                        )
+                    }
+                )
+        else:
+            if not attrs.get('source_location'):
+                raise ValidationError(
+                    {'source_location': _('Source location is required')}
+                )
+            if attrs.get('destination_location'):
+                raise ValidationError(
+                    {
+                        'destination_location': _(
+                            'Destination location is not valid for outbound scans'
+                        )
+                    }
+                )
+            if attrs.get('create_part') or attrs.get('create_stock_item'):
+                raise ValidationError(
+                    _('Outbound scans cannot create products or stock items')
+                )
+
+        return attrs
+
+
+class ScanStockEventSerializer(DataExportSerializerMixin, serializers.ModelSerializer):
+    """Read-only scan business event representation."""
+
+    barcode = serializers.SerializerMethodField()
+    replayed = serializers.SerializerMethodField()
+    tracking_entries = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
+
+    class Meta:
+        """Serializer options for immutable scan events."""
+
+        model = ScanStockEvent
+        fields = [
+            'pk',
+            'client_event_id',
+            'fingerprint_version',
+            'operation',
+            'outcome',
+            'error_code',
+            'error_message',
+            'barcode',
+            'barcode_kind',
+            'requested_quantity',
+            'applied_quantity',
+            'approval_request',
+            'request_line_number',
+            'requested_part_setup',
+            'requested_stock_context',
+            'terminal_reason',
+            'part',
+            'part_pk_snapshot',
+            'part_name_snapshot',
+            'part_ipn_snapshot',
+            'stock_item',
+            'stock_item_pk_snapshot',
+            'batch_snapshot',
+            'source_detail',
+            'detail_uid_snapshot',
+            'label_version_snapshot',
+            'contract_number_snapshot',
+            'acceptance_date_snapshot',
+            'warranty_months_snapshot',
+            'warranty_end_snapshot',
+            'units_snapshot',
+            'purpose',
+            'remark',
+            'approver_snapshot',
+            'source_location',
+            'destination_location',
+            'source_location_path_snapshot',
+            'destination_location_path_snapshot',
+            'stock_item_quantity_before',
+            'stock_item_quantity_after',
+            'part_total_before',
+            'part_total_after',
+            'operator',
+            'operator_user_id_snapshot',
+            'operator_username_snapshot',
+            'operator_display_name_snapshot',
+            'actor_kind',
+            'device_id',
+            'session_id',
+            'replay_count',
+            'replayed',
+            'last_replayed_at',
+            'scanned_at',
+            'completed_at',
+            'tracking_entries',
+        ]
+        read_only_fields = fields
+
+    def get_barcode(self, obj) -> str:
+        """Mask raw barcode data unless the viewer has audit privileges."""
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user and (user.is_staff or user.is_superuser):
+            return obj.barcode
+        return InvenTree.helpers.mask_barcode(obj.barcode)
+
+    @staticmethod
+    def get_replayed(obj) -> bool:
+        """Return whether this event has ever been replayed."""
+        return obj.replay_count > 0
+
+
+class ScanStockApprovalCreateSerializer(serializers.Serializer):
+    """Validate creation of a server-side scan approval draft."""
+
+    direction = serializers.ChoiceField(
+        choices=ScanStockApprovalRequest.Direction.choices
+    )
+    location = serializers.PrimaryKeyRelatedField(
+        queryset=StockLocation.objects.filter(structural=False)
+    )
+
+
+class ScanStockApprovalActionSerializer(serializers.Serializer):
+    """Validate optional lifecycle action notes."""
+
+    note = serializers.CharField(
+        required=False, allow_blank=True, trim_whitespace=True, max_length=2000
+    )
+
+
+class ScanStockApprovalRequestSerializer(serializers.ModelSerializer):
+    """Read-only approval request representation shared by list and detail APIs."""
+
+    lines = ScanStockEventSerializer(many=True, read_only=True)
+    line_count = serializers.IntegerField(read_only=True)
+    active_line_count = serializers.IntegerField(read_only=True)
+    total_quantity = InvenTreeDecimalField(read_only=True)
+    scan_frozen = serializers.SerializerMethodField()
+    pending_inbound = serializers.SerializerMethodField()
+    can_approve = serializers.SerializerMethodField()
+    can_cancel = serializers.SerializerMethodField()
+    business_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        """Serializer options for immutable request reads."""
+
+        model = ScanStockApprovalRequest
+        fields = [
+            'pk',
+            'reference',
+            'direction',
+            'status',
+            'location',
+            'location_path_snapshot',
+            'requester',
+            'requester_user_id_snapshot',
+            'requester_username_snapshot',
+            'requester_display_name_snapshot',
+            'approval_owner',
+            'approval_owner_snapshot',
+            'submitted_at',
+            'activity_at',
+            'expires_at',
+            'decided_by',
+            'decided_at',
+            'decision_note',
+            'cancelled_by',
+            'cancelled_at',
+            'cancel_note',
+            'last_approval_error',
+            'created_at',
+            'updated_at',
+            'line_count',
+            'active_line_count',
+            'total_quantity',
+            'scan_frozen',
+            'pending_inbound',
+            'can_approve',
+            'can_cancel',
+            'business_summary',
+            'lines',
+        ]
+        read_only_fields = fields
+
+    def get_fields(self):
+        """Omit line payloads from list responses while retaining one contract."""
+        fields = super().get_fields()
+        if not self.context.get('include_lines', False):
+            fields.pop('lines', None)
+        return fields
+
+    @staticmethod
+    def annotate_queryset(queryset):
+        """Annotate line counts and active quantity without per-request queries."""
+        active = Q(lines__outcome=ScanStockEvent.Outcome.PENDING)
+        return queryset.annotate(
+            line_count=Count('lines', distinct=True),
+            active_line_count=Count('lines', filter=active, distinct=True),
+            total_quantity=Coalesce(
+                Sum('lines__requested_quantity', filter=active), Decimal(0)
+            ),
+        ).prefetch_related(
+            Prefetch(
+                'lines',
+                queryset=ScanStockEvent.objects.only(
+                    'approval_request_id',
+                    'outcome',
+                    'batch_snapshot',
+                    'contract_number_snapshot',
+                    'acceptance_date_snapshot',
+                    'warranty_months_snapshot',
+                    'warranty_end_snapshot',
+                ),
+                to_attr='wms_summary_lines',
+            )
+        )
+
+    def get_business_summary(self, obj) -> dict:
+        """Summarize snapshot fields without hiding differences across request lines."""
+        lines = getattr(obj, 'wms_summary_lines', None)
+        if lines is None:
+            lines = list(obj.lines.all())
+        active = [
+            line for line in lines if line.outcome != ScanStockEvent.Outcome.FAILED
+        ]
+        lines = active or lines
+        summary = {}
+        for key, field in (
+            ('project', 'batch_snapshot'),
+            ('contract', 'contract_number_snapshot'),
+            ('acceptance_date', 'acceptance_date_snapshot'),
+            ('warranty_months', 'warranty_months_snapshot'),
+            ('warranty_end', 'warranty_end_snapshot'),
+        ):
+            values = {
+                str(value) if (value := getattr(line, field)) is not None else ''
+                for line in lines
+            }
+            summary[key] = (
+                next(iter(values)) if len(values) == 1 else ('多种' if values else '')
+            )
+        return summary
+
+    def get_scan_frozen(self, obj) -> str:
+        """Return active outbound reservation quantity for this request."""
+        if (
+            obj.direction == ScanStockApprovalRequest.Direction.OUTBOUND
+            and obj.status in ScanStockApprovalRequest.active_statuses()
+        ):
+            return str(obj.total_quantity)
+        return '0'
+
+    def get_pending_inbound(self, obj) -> str:
+        """Return active inbound pending quantity for this request."""
+        if (
+            obj.direction == ScanStockApprovalRequest.Direction.INBOUND
+            and obj.status in ScanStockApprovalRequest.active_statuses()
+        ):
+            return str(obj.total_quantity)
+        return '0'
+
+    def get_can_approve(self, obj) -> bool:
+        """Return whether the current user may decide this request now."""
+        from stock.services import ApprovalRequestService
+
+        user = getattr(self.context.get('request'), 'user', None)
+        owner_ids = self.context.get('current_owner_ids')
+        if owner_ids is None and user:
+            from users.models import Owner
+
+            owner_ids = {owner.pk for owner in Owner.get_owners_matching_user(user)}
+        return bool(
+            user
+            and obj.status == ScanStockApprovalRequest.Status.PENDING_APPROVAL
+            and obj.requester_id != user.pk
+            and user.has_perm(ApprovalRequestService.APPROVE_PERMISSION)
+            and obj.approval_owner_id in (owner_ids or set())
+        )
+
+    def get_can_cancel(self, obj) -> bool:
+        """Return whether the current user may cancel this active request."""
+        from stock.services import ApprovalRequestService
+
+        user = getattr(self.context.get('request'), 'user', None)
+        return bool(
+            user
+            and obj.status in ScanStockApprovalRequest.active_statuses()
+            and (
+                obj.requester_id == user.pk
+                or user.has_perm(ApprovalRequestService.AUDIT_PERMISSION)
+            )
+        )
 
 
 class GenerateBatchCodeSerializer(serializers.Serializer):
@@ -290,9 +761,9 @@ class StockItemTestResultSerializer(
             ).first():
                 data['template'] = template
             else:
-                raise ValidationError({
-                    'test': _('No matching test found for this part')
-                })
+                raise ValidationError(
+                    {'test': _('No matching test found for this part')}
+                )
 
         if not template:
             raise ValidationError(_('Template ID or test name must be provided'))
@@ -303,11 +774,13 @@ class StockItemTestResultSerializer(
         finished = data.get('finished_datetime')
 
         if started is not None and finished is not None and started > finished:
-            raise ValidationError({
-                'finished_datetime': _(
-                    'The test finished time cannot be earlier than the test started time'
-                )
-            })
+            raise ValidationError(
+                {
+                    'finished_datetime': _(
+                        'The test finished time cannot be earlier than the test started time'
+                    )
+                }
+            )
         return data
 
 
@@ -325,6 +798,14 @@ class StockItemSerializer(
     - Includes serialization for the linked part
     - Includes serialization for the item location
     """
+
+    wms_warranty = serializers.SerializerMethodField()
+
+    def get_wms_warranty(self, obj) -> dict:
+        """Return current detail warranty, leaving historical stock explicitly empty."""
+        from stock.warranty import warranty_values
+
+        return warranty_values(obj.source_detail)
 
     export_exclude_fields = ['tags', 'tracking_items']
 
@@ -352,6 +833,8 @@ class StockItemSerializer(
             'part',
             'quantity',
             'serial',
+            'source_detail',
+            'wms_warranty',
             'batch',
             'location',
             'belongs_to',
@@ -387,6 +870,8 @@ class StockItemSerializer(
             'serial_numbers',
             # Annotated fields
             'allocated',
+            'scan_frozen',
+            'available_quantity',
             'expired',
             'installed_items',
             'child_items',
@@ -522,16 +1007,53 @@ class StockItemSerializer(
             'belongs_to',
             'sales_order',
             'consumed_by',
-        ).select_related('part', 'part__pricing_data')
+        ).select_related('part', 'part__pricing_data', 'source_detail__contract')
 
         # Annotate the queryset with the total allocated to sales orders
         queryset = queryset.annotate(
             allocated=Coalesce(
-                SubquerySum('sales_order_allocations__quantity'), Decimal(0)
+                SubquerySum(
+                    'sales_order_allocations__quantity',
+                    filter=Q(
+                        line__order__status__in=SalesOrderStatusGroups.OPEN,
+                        shipment__shipment_date=None,
+                    ),
+                ),
+                Decimal(0),
             )
-            # For now, stock allocated to a transfer order will not impact its availability
-            # + Coalesce(SubquerySum('transfer_order_allocations__quantity'), Decimal(0))
             + Coalesce(SubquerySum('allocations__quantity'), Decimal(0))
+            + Coalesce(
+                SubquerySum(
+                    'transfer_order_allocations__quantity',
+                    filter=Q(line__order__status__in=TransferOrderStatusGroups.OPEN),
+                ),
+                Decimal(0),
+            )
+        )
+
+        decimal_output = ModelDecimalField(max_digits=15, decimal_places=5)
+        frozen = (
+            ScanStockEvent.objects.filter(
+                stock_item=OuterRef('pk'),
+                operation=ScanStockEvent.Operation.OUTBOUND,
+                outcome=ScanStockEvent.Outcome.PENDING,
+                approval_request__status__in=ScanStockApprovalRequest.active_statuses(),
+            )
+            .values('stock_item')
+            .annotate(quantity=Sum('requested_quantity'))
+            .values('quantity')[:1]
+        )
+        queryset = queryset.annotate(
+            scan_frozen=Coalesce(
+                Subquery(frozen, output_field=decimal_output),
+                Value(Decimal(0), output_field=decimal_output),
+            )
+        ).annotate(
+            available_quantity=Greatest(
+                F('quantity') - F('allocated') - F('scan_frozen'),
+                Value(Decimal(0), output_field=decimal_output),
+                output_field=decimal_output,
+            )
         )
 
         # Annotate the queryset with the number of tracking items
@@ -654,6 +1176,10 @@ class StockItemSerializer(
     # Annotated fields
     allocated = serializers.FloatField(
         read_only=True, allow_null=True, label=_('Allocated Quantity')
+    )
+    scan_frozen = InvenTreeDecimalField(read_only=True, label=_('Scan Frozen Quantity'))
+    available_quantity = InvenTreeDecimalField(
+        read_only=True, label=_('Available Quantity')
     )
     expired = serializers.BooleanField(
         read_only=True, allow_null=True, label=_('Expired')
@@ -892,9 +1418,13 @@ class InstallStockItemSerializer(serializers.Serializer):
         quantity = data.get('quantity', stock_item.quantity)
 
         if quantity > stock_item.quantity:
-            raise ValidationError({
-                'quantity': _('Quantity to install must not exceed available quantity')
-            })
+            raise ValidationError(
+                {
+                    'quantity': _(
+                        'Quantity to install must not exceed available quantity'
+                    )
+                }
+            )
 
         return data
 
@@ -1339,6 +1869,7 @@ class StockChangeStatusSerializer(serializers.Serializer):
                     date=now,
                     deltas=deltas,
                     user=user,
+                    **operator_snapshot(user),
                     notes=note,
                 )
             )
@@ -1442,6 +1973,7 @@ class LocationSerializer(
             'items',
             'sublocations',
             'owner',
+            'approval_owner',
             'icon',
             'custom_icon',
             'structural',
@@ -1534,8 +2066,22 @@ class StockTrackingSerializer(
             'tracking_type',
             'user',
             'user_detail',
+            'operator_user_id_snapshot',
+            'operator_username_snapshot',
+            'operator_display_name_snapshot',
+            'scan_event',
         ]
-        read_only_fields = ['date', 'part', 'user', 'label', 'tracking_type']
+        read_only_fields = [
+            'date',
+            'part',
+            'user',
+            'label',
+            'tracking_type',
+            'operator_user_id_snapshot',
+            'operator_username_snapshot',
+            'operator_display_name_snapshot',
+            'scan_event',
+        ]
 
     label = serializers.CharField(read_only=True)
 

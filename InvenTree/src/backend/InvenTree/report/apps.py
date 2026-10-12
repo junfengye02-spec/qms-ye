@@ -81,12 +81,15 @@ class ReportConfig(AppConfig):
         except Exception:
             pass
 
-    def file_from_template(self, dir_name: str, file_name: str) -> ContentFile:
+    def file_from_template(
+        self, dir_name: str, file_name: str, storage_name: str | None = None
+    ) -> ContentFile:
         """Construct a new ContentFile from a template file.
 
         Args:
             dir_name (str): The name of the directory containing the template
             file_name (str): The name of the template file
+            storage_name (str): Optional distinct name for the stored template file
         Returns:
             ContentFile: The ContentFile object containing the template
         """
@@ -96,7 +99,9 @@ class ReportConfig(AppConfig):
             raise FileNotFoundError(
                 'Template file %s does not exist in %s', file_name, file
             )
-        return ContentFile(file.read_bytes(), os.path.basename(file_name))
+        return ContentFile(
+            file.read_bytes(), storage_name or os.path.basename(file_name)
+        )
 
     def create_default_labels(self):
         """Create default label templates."""
@@ -111,6 +116,14 @@ class ReportConfig(AppConfig):
 
         label_templates = [
             {
+                'file': 'wms_complete_receipt.html',
+                'name': 'WMS Complete Receipt Label',
+                'description': 'Equipment, project and contract by receipt detail',
+                'model_type': 'wmsreceiptdetail',
+                'width': 50,
+                'height': 30,
+            },
+            {
                 'file': 'part_label.html',
                 'name': 'InvenTree Part Label',
                 'description': 'Sample part label',
@@ -123,10 +136,28 @@ class ReportConfig(AppConfig):
                 'model_type': 'part',
             },
             {
+                'file': report.models.PRODUCT_IPN_LABEL_FILENAME,
+                'name': report.models.PRODUCT_IPN_LABEL_NAME,
+                'description': report.models.PRODUCT_IPN_LABEL_DESCRIPTION,
+                'model_type': 'part',
+                'width': 50,
+                'height': 30,
+                'storage_name': 'product_ipn_qr_part.html',
+            },
+            {
                 'file': 'stockitem_qr.html',
                 'name': 'InvenTree Stock Item Label (QR)',
                 'description': 'Sample stock item label with QR code',
                 'model_type': 'stockitem',
+            },
+            {
+                'file': report.models.PRODUCT_IPN_LABEL_FILENAME,
+                'name': report.models.PRODUCT_IPN_LABEL_NAME,
+                'description': report.models.PRODUCT_IPN_LABEL_DESCRIPTION,
+                'model_type': 'stockitem',
+                'width': 50,
+                'height': 30,
+                'storage_name': 'product_ipn_qr_stockitem.html',
             },
             {
                 'file': 'stocklocation_qr_and_text.html',
@@ -150,6 +181,7 @@ class ReportConfig(AppConfig):
 
         for template in label_templates:
             filename = template.pop('file')
+            storage_name = template.pop('storage_name', None)
 
             # Template already exists in the database - check that the file exists too
             if existing_template := report.models.LabelTemplate.objects.filter(
@@ -158,7 +190,7 @@ class ReportConfig(AppConfig):
                 if not default_storage.exists(existing_template.template.name):
                     # The file does not exist in the storage system - add it in
                     existing_template.template = self.file_from_template(
-                        'label', filename
+                        'label', filename, storage_name=storage_name
                     )
                     existing_template.save()
                 continue
@@ -168,7 +200,10 @@ class ReportConfig(AppConfig):
                 # Create a new entry
                 with transaction.atomic():
                     report.models.LabelTemplate.objects.create(
-                        **template, template=self.file_from_template('label', filename)
+                        **template,
+                        template=self.file_from_template(
+                            'label', filename, storage_name=storage_name
+                        ),
                     )
                 logger.info("Creating new label template: '%s'", template['name'])
             except ValidationError:

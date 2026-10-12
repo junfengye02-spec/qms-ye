@@ -2,12 +2,15 @@
 
 import os
 import random
+import uuid
 from datetime import datetime, timedelta
 
+from django.contrib.auth.models import Group, User
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.test.utils import override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 import pytest
 from djmoney.money import Money
@@ -22,10 +25,14 @@ from common.settings import set_global_setting
 from InvenTree.unit_test import (
     InvenTreeAPIPerformanceTestCase,
     InvenTreeAPITestCase,
+    addUserPermission,
     findOffloadedEvent,
 )
 from part.models import Part, PartTestTemplate
+from stock.api import ScanInboundView
 from stock.models import (
+    ScanStockApprovalRequest,
+    ScanStockEvent,
     StockItem,
     StockItemTestResult,
     StockItemTracking,
@@ -33,6 +40,8 @@ from stock.models import (
     StockLocationType,
 )
 from stock.status_codes import StockHistoryCode, StockStatus
+from users.models import Owner, get_user_display_name
+from users.oauth2_scopes import get_granular_scope
 
 
 class StockAPITestCase(InvenTreeAPITestCase):
@@ -56,9 +65,970 @@ class StockAPITestCase(InvenTreeAPITestCase):
         'stock_location.change',
         'stock_location.add',
         'stock_location.delete',
+        'stock_location.view',
         'stock.delete',
+        'part.add',
+        'part.change',
         'part.view',
+        'part_category.view',
     ]
+
+
+class ScanStockAPITest(StockAPITestCase):
+    """Focused API contract tests for inbound and outbound stock scans."""
+
+    inbound_url = reverse('api-stock-scan-inbound-v2')
+    outbound_url = reverse('api-stock-scan-outbound')
+
+    def setUp(self):
+        """Create isolated products and locations for scan tests."""
+        super().setUp()
+        self.default_location = StockLocation.objects.get(pk=2)
+        self.location = StockLocation.objects.create(name='Scan work shelf')
+        self.other_location = StockLocation.objects.create(name='Other scan shelf')
+        self.part = Part.objects.create(
+            name='Scan stock part',
+            description='Part used by shared scan stock API tests',
+            IPN='SCAN-001',
+            default_location=self.default_location,
+        )
+        # Most tests exercise business behavior as an administrator. Permission
+        # matrix tests explicitly lower this account back to a role-based user.
+        self.user.is_superuser = True
+        self.user.save()
+
+    def use_role_permissions(self):
+        """Lower the test account from administrator to configured role checks."""
+        self.user.is_superuser = False
+        self.user.save()
+
+    def scan_payload(self, *, operation='inbound', barcode=None, event_id=None, **extra):
+        """Return a valid request with an explicit directional location."""
+        location_field = (
+            'destination_location' if operation == 'inbound' else 'source_location'
+        )
+        return {
+            'barcode': self.part.IPN if barcode is None else barcode,
+            'client_event_id': str(event_id or uuid.uuid4()),
+            location_field: self.location.pk,
+            **extra,
+        }
+
+    def new_part_payload(self, *, barcode='880000000095', event_id=None, **overrides):
+        """Return a final quick-setup request for an unknown inbound barcode."""
+        payload = self.scan_payload(barcode=barcode, event_id=event_id)
+        payload['create_part'] = {
+            'name': 'New scanned product',
+            'description': 'Created from the scan stock workbench',
+            'category': None,
+            'default_location': self.location.pk,
+            **overrides,
+        }
+        return payload
+
+    def assert_one_tracking(self, event, tracking_type):
+        """Return the sole native tracking entry linked to an event."""
+        entries = StockItemTracking.objects.filter(
+            scan_event=event, tracking_type=tracking_type
+        )
+        self.assertEqual(entries.count(), 1)
+        return entries.get()
+
+    def test_explicit_location_is_required_and_default_is_not_silent(self):
+        """Both directions reject a missing location before claiming an event."""
+        event_id = uuid.uuid4()
+        self.post(
+            self.inbound_url,
+            {'barcode': self.part.IPN, 'client_event_id': str(event_id)},
+            expected_code=400,
+        )
+        self.post(
+            self.outbound_url,
+            {'barcode': self.part.IPN, 'client_event_id': str(uuid.uuid4())},
+            expected_code=400,
+        )
+
+        self.assertFalse(ScanStockEvent.objects.exists())
+        self.assertFalse(StockItem.objects.filter(part=self.part).exists())
+
+    def test_inbound_uses_unique_neutral_item_at_explicit_location(self):
+        """Known product inbound adds only to the unique neutral stock item."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=4
+        )
+
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(quantity='2'),
+            expected_code=201,
+        ).data
+
+        item.refresh_from_db()
+        event = ScanStockEvent.objects.get()
+        self.assertEqual(item.quantity, 6)
+        self.assertFalse(item.is_scan_inbound_item)
+        self.assertEqual(StockItem.objects.filter(part=self.part).count(), 1)
+        self.assertTrue(response['success'])
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.SUCCESS)
+        self.assertEqual(event.stock_item, item)
+        self.assertEqual(event.destination_location, self.location)
+        self.assertEqual(event.stock_item_quantity_before, 4)
+        self.assertEqual(event.stock_item_quantity_after, 6)
+        self.assertEqual(event.applied_quantity, 2)
+        tracking = self.assert_one_tracking(event, StockHistoryCode.STOCK_ADD)
+        self.assertEqual(tracking.item, item)
+
+    def test_inbound_creates_one_ordinary_item_and_one_tracking_entry(self):
+        """A missing candidate creates one ordinary item through one native add."""
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(quantity='3'),
+            expected_code=201,
+        ).data
+
+        item = StockItem.objects.get(part=self.part, location=self.location)
+        event = ScanStockEvent.objects.get()
+        self.assertTrue(response['success'])
+        self.assertEqual(item.quantity, 3)
+        self.assertEqual(item.batch, '')
+        self.assertFalse(item.is_scan_inbound_item)
+        self.assertEqual(ScanStockEvent.objects.count(), 1)
+        tracking = self.assert_one_tracking(event, StockHistoryCode.STOCK_ADD)
+        self.assertEqual(StockItemTracking.objects.filter(item=item).count(), 1)
+        self.assertEqual(tracking.item, item)
+
+    def test_product_ipn_is_the_scan_code(self):
+        """A product resolves directly from its unique internal part number."""
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(barcode=f'  {self.part.IPN}  '),
+            expected_code=201,
+        ).data
+
+        event = ScanStockEvent.objects.get()
+        self.assertTrue(response['success'])
+        self.assertEqual(event.barcode, self.part.IPN)
+        self.assertEqual(event.barcode_kind, ScanStockEvent.BarcodeKind.PART)
+        self.assertEqual(event.part, self.part)
+
+    def test_legacy_custom_product_barcode_still_resolves(self):
+        """Existing linked custom barcodes remain valid during the transition."""
+        legacy_barcode = '880000000099'
+        self.part.assign_barcode(barcode_data=legacy_barcode)
+
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(barcode=legacy_barcode),
+            expected_code=201,
+        ).data
+
+        self.assertTrue(response['success'])
+        self.assertEqual(ScanStockEvent.objects.get().part, self.part)
+
+    def test_same_part_ipn_and_legacy_barcode_are_one_match(self):
+        """A redundant legacy barcode on the same Part is not ambiguous."""
+        self.part.assign_barcode(barcode_data=self.part.IPN)
+
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(),
+            expected_code=201,
+        ).data
+
+        self.assertTrue(response['success'])
+        self.assertEqual(ScanStockEvent.objects.get().part, self.part)
+
+    def test_ipn_collision_with_legacy_object_barcode_is_ambiguous(self):
+        """An IPN never overrides a legacy barcode owned by another object."""
+        other_part = Part.objects.create(name='Legacy barcode owner', IPN='OTHER-IPN')
+        legacy_item = StockItem.objects.create(
+            part=other_part, location=self.location, quantity=1
+        )
+        legacy_item.assign_barcode(barcode_data=self.part.IPN)
+
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(),
+            expected_code=400,
+        ).data
+
+        self.assertEqual(response['error_code'], 'AMBIGUOUS_BARCODE')
+        legacy_item.refresh_from_db()
+        self.assertEqual(legacy_item.quantity, 1)
+
+    def test_unknown_inbound_preflight_then_atomic_quick_setup(self):
+        """SETUP_REQUIRED does not claim the UUID; final setup performs one inbound."""
+        barcode = '880000000095'
+        event_id = uuid.uuid4()
+        preflight = self.post(
+            self.inbound_url,
+            self.scan_payload(barcode=barcode, event_id=event_id),
+            expected_code=200,
+        ).data
+
+        self.assertFalse(preflight['success'])
+        self.assertFalse(preflight['terminal'])
+        self.assertEqual(preflight['error_code'], 'SETUP_REQUIRED')
+        self.assertFalse(ScanStockEvent.objects.exists())
+        self.assertFalse(Part.objects.filter(IPN__iexact=barcode).exists())
+
+        created = self.post(
+            self.inbound_url,
+            self.new_part_payload(barcode=barcode, event_id=event_id),
+            expected_code=201,
+        ).data
+
+        part = Part.objects.get(IPN=barcode)
+        item = StockItem.objects.get(part=part, location=self.location)
+        event = ScanStockEvent.objects.get(client_event_id=event_id)
+        self.assertTrue(created['success'])
+        self.assertTrue(created['part_created'])
+        self.assertEqual(part.barcode_data, '')
+        self.assertEqual(part.default_location, self.location)
+        self.assertEqual(part.IPN, barcode)
+        self.assertEqual(item.quantity, 1)
+        self.assertFalse(item.is_scan_inbound_item)
+        self.assert_one_tracking(event, StockHistoryCode.STOCK_ADD)
+
+    def test_unknown_ipn_must_fit_the_part_field(self):
+        """Quick setup rejects a scanned IPN longer than the Part field."""
+        ipn = 'X' * 101
+
+        response = self.post(
+            self.inbound_url,
+            self.new_part_payload(barcode=ipn),
+            expected_code=400,
+        ).data
+
+        self.assertEqual(response['error_code'], 'IPN_TOO_LONG')
+        self.assertFalse(Part.objects.filter(IPN=ipn).exists())
+
+    def test_outbound_removes_exact_stock_item(self):
+        """An internal stock-item barcode removes the strict requested quantity."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=3, delete_on_deplete=False
+        )
+        payload = self.scan_payload(
+            operation='outbound', barcode=f'INV-SI{item.pk}', quantity='2'
+        )
+
+        response = self.post(self.outbound_url, payload, expected_code=201).data
+
+        item.refresh_from_db()
+        event = ScanStockEvent.objects.get()
+        self.assertTrue(response['success'])
+        self.assertEqual(item.quantity, 1)
+        self.assertEqual(event.operation, ScanStockEvent.Operation.OUTBOUND)
+        self.assertEqual(event.barcode_kind, ScanStockEvent.BarcodeKind.STOCK_ITEM)
+        self.assertEqual(event.source_location, self.location)
+        self.assertEqual(event.stock_item_quantity_before, 3)
+        self.assertEqual(event.stock_item_quantity_after, 1)
+        self.assert_one_tracking(event, StockHistoryCode.STOCK_REMOVE)
+
+    def test_unknown_outbound_is_a_replayable_failed_event(self):
+        """Unknown outbound never creates a Part and persists one failed event."""
+        barcode = '999999999999'
+        event_id = uuid.uuid4()
+        payload = self.scan_payload(
+            operation='outbound', barcode=barcode, event_id=event_id
+        )
+
+        failed = self.post(self.outbound_url, payload, expected_code=400).data
+        replayed = self.post(self.outbound_url, payload, expected_code=400).data
+
+        event = ScanStockEvent.objects.get(client_event_id=event_id)
+        self.assertFalse(failed['success'])
+        self.assertEqual(failed['error_code'], 'UNKNOWN_BARCODE')
+        self.assertTrue(replayed['replayed'])
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.FAILED)
+        self.assertEqual(event.applied_quantity, 0)
+        self.assertEqual(event.replay_count, 1)
+        self.assertFalse(Part.objects.filter(IPN__iexact=barcode).exists())
+        self.assertFalse(StockItemTracking.objects.filter(scan_event=event).exists())
+
+    def test_missing_internal_codes_never_become_product_ipns(self):
+        """Reserved short and JSON codes fail instead of entering quick setup."""
+        for barcode in ['INV-PA99999999', '{"part": 99999999}']:
+            response = self.post(
+                self.inbound_url,
+                self.scan_payload(barcode=barcode),
+                expected_code=400,
+            ).data
+            self.assertEqual(response['error_code'], 'INTERNAL_BARCODE_NOT_FOUND')
+            self.assertFalse(Part.objects.filter(IPN=barcode).exists())
+
+        malformed = 'INV-PA-NOT-A-NUMBER'
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(barcode=malformed),
+            expected_code=400,
+        ).data
+        self.assertEqual(response['error_code'], 'INVALID_INTERNAL_BARCODE')
+        self.assertFalse(Part.objects.filter(IPN=malformed).exists())
+
+    def test_outbound_rejects_insufficient_unallocated_stock(self):
+        """Allocated stock is unavailable and a strict shortfall is fully audited."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=5, delete_on_deplete=False
+        )
+        customer = company.models.Company.objects.create(
+            name='Scan allocation customer', is_customer=True
+        )
+        sales_order = order.models.SalesOrder.objects.create(
+            customer=customer, reference='SCAN-SO-001'
+        )
+        line = order.models.SalesOrderLineItem.objects.create(
+            order=sales_order, part=self.part, quantity=4
+        )
+        shipment = order.models.SalesOrderShipment.objects.create(
+            order=sales_order, reference='SCAN-SHIP-001'
+        )
+        order.models.SalesOrderAllocation.objects.create(
+            line=line, shipment=shipment, item=item, quantity=4
+        )
+
+        response = self.post(
+            self.outbound_url,
+            self.scan_payload(operation='outbound', quantity='2'),
+            expected_code=400,
+        ).data
+
+        item.refresh_from_db()
+        event = ScanStockEvent.objects.get()
+        self.assertEqual(response['error_code'], 'INSUFFICIENT_UNALLOCATED_STOCK')
+        self.assertEqual(item.quantity, 5)
+        self.assertEqual(item.unallocated_quantity(), 1)
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.FAILED)
+        self.assertEqual(event.applied_quantity, 0)
+        self.assertFalse(StockItemTracking.objects.filter(scan_event=event).exists())
+
+    def test_selection_preflight_does_not_claim_uuid(self):
+        """A non-terminal candidate choice can reuse its UUID for final execution."""
+        neutral = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=2
+        )
+        batched = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=7, batch='LOT-A'
+        )
+        event_id = uuid.uuid4()
+        payload = self.scan_payload(event_id=event_id)
+
+        preflight = self.post(
+            self.inbound_url, payload, expected_code=200
+        ).data
+
+        self.assertFalse(preflight['terminal'])
+        self.assertEqual(preflight['error_code'], 'STOCK_SELECTION_REQUIRED')
+        self.assertEqual(
+            {candidate['pk'] for candidate in preflight['candidates']},
+            {neutral.pk, batched.pk},
+        )
+        self.assertFalse(ScanStockEvent.objects.exists())
+
+        payload['stock_item_id'] = neutral.pk
+        completed = self.post(self.inbound_url, payload, expected_code=201).data
+
+        neutral.refresh_from_db()
+        batched.refresh_from_db()
+        self.assertTrue(completed['success'])
+        self.assertEqual(neutral.quantity, 3)
+        self.assertEqual(batched.quantity, 7)
+        self.assertEqual(ScanStockEvent.objects.count(), 1)
+
+    def test_uuid_replay_and_conflict_do_not_repeat_stock_change(self):
+        """A matching UUID replays; changing any fingerprint input returns 409."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=2
+        )
+        event_id = uuid.uuid4()
+        payload = self.scan_payload(event_id=event_id)
+
+        created = self.post(self.inbound_url, payload, expected_code=201).data
+        replayed = self.post(self.inbound_url, payload, expected_code=200).data
+        conflict = self.post(
+            self.inbound_url,
+            {**payload, 'quantity': '2'},
+            expected_code=409,
+        ).data
+
+        item.refresh_from_db()
+        event = ScanStockEvent.objects.get(client_event_id=event_id)
+        self.assertFalse(created['replayed'])
+        self.assertTrue(replayed['replayed'])
+        self.assertEqual(conflict['error_code'], 'IDEMPOTENCY_CONFLICT')
+        self.assertEqual(item.quantity, 3)
+        self.assertEqual(event.replay_count, 1)
+        self.assertEqual(ScanStockEvent.objects.count(), 1)
+        self.assert_one_tracking(event, StockHistoryCode.STOCK_ADD)
+
+    def test_legacy_event_replays_by_barcode_and_operator_contract(self):
+        """A legacy-v0 UUID ignores newer location and DTO fingerprint fields."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.default_location, quantity=6
+        )
+        event_id = uuid.uuid4()
+        event = ScanStockEvent.objects.create(
+            client_event_id=event_id,
+            request_fingerprint='legacy-v0-does-not-have-a-v1-fingerprint',
+            fingerprint_version='legacy-v0',
+            operation=ScanStockEvent.Operation.INBOUND,
+            outcome=ScanStockEvent.Outcome.SUCCESS,
+            barcode=self.part.IPN,
+            barcode_hash='legacy-barcode-hash',
+            barcode_kind=ScanStockEvent.BarcodeKind.PART,
+            requested_quantity=1,
+            applied_quantity=1,
+            part=self.part,
+            part_pk_snapshot=self.part.pk,
+            part_name_snapshot=self.part.name,
+            stock_item=item,
+            stock_item_pk_snapshot=item.pk,
+            destination_location=self.default_location,
+            operator=self.user,
+            operator_user_id_snapshot=self.user.pk,
+            operator_username_snapshot=self.user.username,
+            operator_display_name_snapshot=str(self.user),
+            completed_at=timezone.now(),
+        )
+        self.part.default_location = self.other_location
+        self.part.save()
+
+        response = self.post(
+            self.inbound_url,
+            self.scan_payload(event_id=event_id),
+            expected_code=200,
+        ).data
+
+        item.refresh_from_db()
+        event.refresh_from_db()
+        self.assertTrue(response['replayed'])
+        self.assertEqual(item.quantity, 6)
+        self.assertEqual(event.replay_count, 1)
+        self.assertEqual(ScanStockEvent.objects.count(), 1)
+        self.assertFalse(StockItemTracking.objects.filter(scan_event=event).exists())
+
+    def test_outbound_depletion_retains_event_snapshots_and_tracking(self):
+        """Native delete-on-deplete keeps the event and its linked stock history."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=1, delete_on_deplete=True
+        )
+        item_pk = item.pk
+
+        response = self.post(
+            self.outbound_url,
+            self.scan_payload(operation='outbound', barcode=f'INV-SI{item_pk}'),
+            expected_code=201,
+        ).data
+
+        event = ScanStockEvent.objects.get()
+        tracking = self.assert_one_tracking(event, StockHistoryCode.STOCK_REMOVE)
+        self.assertTrue(response['success'])
+        self.assertFalse(StockItem.objects.filter(pk=item_pk).exists())
+        self.assertIsNone(event.stock_item)
+        self.assertEqual(event.stock_item_pk_snapshot, item_pk)
+        self.assertEqual(event.stock_item_quantity_before, 1)
+        self.assertEqual(event.stock_item_quantity_after, 0)
+        self.assertIsNone(tracking.item)
+        self.assertEqual(tracking.part, self.part)
+        self.assertEqual(tracking.scan_event, event)
+
+    def test_operator_and_tracking_snapshots_ignore_client_fields(self):
+        """The authenticated user is snapshotted in both immutable audit records."""
+        self.user.first_name = 'Scan'
+        self.user.last_name = 'Operator'
+        self.user.save()
+        StockItem.objects.create(part=self.part, location=self.location, quantity=1)
+        payload = self.scan_payload(
+            operator=999999,
+            operator_username_snapshot='forged-user',
+            operator_display_name_snapshot='Forged Operator',
+        )
+
+        self.post(self.inbound_url, payload, expected_code=201)
+
+        event = ScanStockEvent.objects.get()
+        tracking = self.assert_one_tracking(event, StockHistoryCode.STOCK_ADD)
+        original_username = self.user.username
+        original_display_name = get_user_display_name(self.user)
+        self.assertEqual(event.operator, self.user)
+        self.assertEqual(event.operator_user_id_snapshot, self.user.pk)
+        self.assertEqual(event.operator_username_snapshot, original_username)
+        self.assertEqual(event.operator_display_name_snapshot, original_display_name)
+        self.assertEqual(tracking.operator_user_id_snapshot, self.user.pk)
+        self.assertEqual(tracking.operator_username_snapshot, original_username)
+        self.assertEqual(tracking.operator_display_name_snapshot, original_display_name)
+
+        self.user.username = 'renamed-after-scan'
+        self.user.save()
+        event.refresh_from_db()
+        tracking.refresh_from_db()
+        self.assertEqual(event.operator_username_snapshot, original_username)
+        self.assertEqual(event.operator_display_name_snapshot, original_display_name)
+        self.assertEqual(tracking.operator_username_snapshot, original_username)
+
+    def test_scan_permission_matrix(self):
+        """View/add roles cannot mutate stock; change can adjust an existing item."""
+        item = StockItem.objects.create(
+            part=self.part, location=self.location, quantity=2
+        )
+        self.use_role_permissions()
+        self.clearRoles()
+        self.assignRole('stock.view')
+        self.get(self.inbound_url, expected_code=200)
+        self.post(self.inbound_url, self.scan_payload(), expected_code=403)
+
+        self.clearRoles()
+        # RuleSet.save() normally makes add imply change. Bypass that UI
+        # convenience to prove this endpoint does not authorize from POST/add.
+        self.group.rule_sets.filter(name='stock').update(
+            can_view=True, can_add=True, can_change=False, can_delete=False
+        )
+        self.post(
+            self.outbound_url,
+            self.scan_payload(operation='outbound'),
+            expected_code=403,
+        )
+
+        self.clearRoles()
+        self.assignRole('stock.change')
+        self.post(self.inbound_url, self.scan_payload(), expected_code=201)
+        item.refresh_from_db()
+        self.assertEqual(item.quantity, 3)
+        self.assertEqual(ScanStockEvent.objects.count(), 1)
+
+    def test_creating_stock_item_requires_add_permission(self):
+        """Change permits adjustment, but a new stock row additionally needs add."""
+        self.use_role_permissions()
+        self.clearRoles()
+        self.assignRole('stock.change')
+        denied = self.post(
+            self.inbound_url, self.scan_payload(), expected_code=400
+        ).data
+
+        self.assertEqual(
+            denied['error_code'], 'STOCK_ITEM_CREATE_PERMISSION_DENIED'
+        )
+        self.assertFalse(StockItem.objects.filter(part=self.part).exists())
+
+        self.assignRole('stock.add')
+        self.post(self.inbound_url, self.scan_payload(), expected_code=201)
+        self.assertEqual(StockItem.objects.filter(part=self.part).count(), 1)
+
+    def test_quick_setup_permission_failure_leaves_no_partial_product(self):
+        """Unknown setup needs Part add and StockItem add permissions."""
+        barcode = '880000000094'
+        self.use_role_permissions()
+        self.clearRoles()
+        self.assignRole('stock.change')
+        self.assignRole('stock.add')
+        self.post(
+            self.inbound_url,
+            self.new_part_payload(barcode=barcode),
+            expected_code=403,
+        )
+
+        self.assertFalse(Part.objects.filter(IPN__iexact=barcode).exists())
+        self.assertFalse(StockItem.objects.filter(part__IPN__iexact=barcode).exists())
+        self.assertFalse(ScanStockEvent.objects.exists())
+
+    def test_quick_setup_does_not_require_part_change_permission(self):
+        """Deriving IPN during Part creation only requires the Part add permission."""
+        barcode = 'SCAN-PART-ADD-ONLY'
+        self.use_role_permissions()
+        self.clearRoles()
+        self.assignRole('stock.change')
+        self.assignRole('stock.add')
+        self.assignRole('part.add')
+
+        response = self.post(
+            self.inbound_url,
+            self.new_part_payload(barcode=barcode),
+            expected_code=201,
+        ).data
+
+        self.assertTrue(response['success'])
+        self.assertEqual(Part.objects.get(IPN=barcode).barcode_data, '')
+
+    def test_quick_setup_rejects_a_different_client_ipn(self):
+        """Rolling-deploy compatibility input cannot override the scanned IPN."""
+        payload = self.new_part_payload(barcode='SCAN-CANONICAL-IPN')
+        payload['create_part']['IPN'] = 'DIFFERENT-IPN'
+
+        self.post(self.inbound_url, payload, expected_code=400)
+
+        self.assertFalse(Part.objects.filter(IPN='SCAN-CANONICAL-IPN').exists())
+        self.assertFalse(Part.objects.filter(IPN='DIFFERENT-IPN').exists())
+        self.assertFalse(ScanStockEvent.objects.exists())
+
+    def test_scan_requires_authentication_and_valid_envelope(self):
+        """Authentication and serializer failures never create business events."""
+        self.logout()
+        self.post(self.inbound_url, self.scan_payload(), expected_code=401)
+
+        self.login()
+        for payload in [
+            {},
+            self.scan_payload(barcode=''),
+            self.scan_payload(event_id='not-a-uuid'),
+            self.scan_payload(quantity=0),
+        ]:
+            self.post(self.inbound_url, payload, expected_code=400)
+        self.assertFalse(ScanStockEvent.objects.exists())
+
+    def test_scan_declares_change_stock_oauth_scope(self):
+        """Both scan directions require the stock mutation OAuth scope."""
+        self.assertEqual(
+            ScanInboundView.required_alternate_scopes['POST'],
+            [[get_granular_scope('change', 'stock')]],
+        )
+
+
+class ScanStockApprovalAPITest(StockAPITestCase):
+    """Approval lifecycle integration tests against native stock methods."""
+
+    def setUp(self):
+        """Create a requester, distinct approval group and isolated stock context."""
+        super().setUp()
+        set_global_setting('SCAN_APPROVAL_ENABLED', True)
+        self.location = StockLocation.objects.create(name='Approval shelf')
+        self.part = Part.objects.create(name='Approval part', IPN='APPROVAL-IPN')
+        self.item = StockItem.objects.create(
+            part=self.part,
+            location=self.location,
+            quantity=5,
+            delete_on_deplete=False,
+        )
+        self.approver = User.objects.create_user(
+            username='scan-approver', password='test-password'
+        )
+        addUserPermission(
+            self.approver,
+            'stock',
+            'scanstockapprovalrequest',
+            'approve',
+        )
+        self.approval_group = Group.objects.create(name='Scan approval group')
+        self.approver.groups.add(self.approval_group)
+        self.location.approval_owner = Owner.get_owner(self.approval_group)
+        self.location.save()
+
+    def create_request(self, direction):
+        """Create one request through its public API."""
+        return self.post(
+            reverse('api-stock-scan-request-list'),
+            {'direction': direction, 'location': self.location.pk},
+            expected_code=201,
+        ).data
+
+    def test_outbound_freeze_submit_self_guard_and_atomic_approval(self):
+        """Outbound scans freeze immediately and only a distinct approver applies them."""
+        approval = self.create_request(ScanStockApprovalRequest.Direction.OUTBOUND)
+        scan = self.post(
+            reverse('api-stock-scan-outbound'),
+            {
+                'barcode': f'INV-SI{self.item.pk}',
+                'client_event_id': str(uuid.uuid4()),
+                'quantity': '2',
+                'source_location': self.location.pk,
+                'approval_request_id': approval['pk'],
+            },
+            expected_code=201,
+        ).data
+
+        self.item.refresh_from_db()
+        event = ScanStockEvent.objects.get(approval_request_id=approval['pk'])
+        self.assertTrue(scan['success'])
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.PENDING)
+        self.assertEqual(self.item.quantity, 5)
+        self.assertEqual(self.item.scan_frozen_quantity(), 2)
+        self.assertEqual(self.item.unallocated_quantity(), 3)
+
+        self.post(
+            reverse('api-stock-scan-request-submit', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        )
+        denied = self.post(
+            reverse('api-stock-scan-request-approve', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=409,
+        ).data
+        self.assertEqual(denied['error_code'], 'SELF_APPROVAL_FORBIDDEN')
+
+        self.client.force_authenticate(user=self.approver)
+        completed = self.post(
+            reverse('api-stock-scan-request-approve', kwargs={'pk': approval['pk']}),
+            {'note': 'Approved'},
+            expected_code=200,
+        ).data
+
+        self.item.refresh_from_db()
+        event.refresh_from_db()
+        self.assertEqual(completed['status'], ScanStockApprovalRequest.Status.COMPLETED)
+        self.assertEqual(self.item.quantity, 3)
+        self.assertEqual(self.item.scan_frozen_quantity(), 0)
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.SUCCESS)
+        self.assertEqual(event.applied_quantity, 2)
+        self.assertEqual(StockItemTracking.objects.filter(scan_event=event).count(), 1)
+
+    def test_cancel_releases_freeze_without_stock_change(self):
+        """Cancelling a draft terminalizes lines and releases its reservation once."""
+        approval = self.create_request(ScanStockApprovalRequest.Direction.OUTBOUND)
+        self.post(
+            reverse('api-stock-scan-outbound'),
+            {
+                'barcode': f'INV-SI{self.item.pk}',
+                'client_event_id': str(uuid.uuid4()),
+                'quantity': '4',
+                'source_location': self.location.pk,
+                'approval_request_id': approval['pk'],
+            },
+            expected_code=201,
+        )
+        self.assertEqual(self.item.scan_frozen_quantity(), 4)
+
+        cancelled = self.post(
+            reverse('api-stock-scan-request-cancel', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        ).data
+
+        self.item.refresh_from_db()
+        event = ScanStockEvent.objects.get(approval_request_id=approval['pk'])
+        self.assertEqual(cancelled['status'], ScanStockApprovalRequest.Status.CANCELLED)
+        self.assertEqual(self.item.quantity, 5)
+        self.assertEqual(self.item.scan_frozen_quantity(), 0)
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.FAILED)
+        self.assertEqual(event.terminal_reason, 'REQUEST_CANCELLED')
+        self.assertFalse(StockItemTracking.objects.filter(scan_event=event).exists())
+
+    def test_unknown_inbound_rejection_leaves_no_partial_part(self):
+        """Unknown inbound setup remains a snapshot until whole-request approval."""
+        approval = self.create_request(ScanStockApprovalRequest.Direction.INBOUND)
+        barcode = 'PENDING-NEW-IPN'
+        response = self.post(
+            reverse('api-stock-scan-inbound-v2'),
+            {
+                'barcode': barcode,
+                'client_event_id': str(uuid.uuid4()),
+                'quantity': '3',
+                'destination_location': self.location.pk,
+                'approval_request_id': approval['pk'],
+                'create_part': {
+                    'name': 'Pending new product',
+                    'description': '',
+                    'category': None,
+                    'default_location': self.location.pk,
+                },
+            },
+            expected_code=201,
+        ).data
+
+        self.assertTrue(response['success'])
+        self.assertFalse(Part.objects.filter(IPN=barcode).exists())
+        self.post(
+            reverse('api-stock-scan-request-submit', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        )
+        self.client.force_authenticate(user=self.approver)
+        self.post(
+            reverse('api-stock-scan-request-reject', kwargs={'pk': approval['pk']}),
+            {'note': 'Not required'},
+            expected_code=200,
+        )
+        self.assertFalse(Part.objects.filter(IPN=barcode).exists())
+
+    def test_unknown_inbound_approval_creates_part_stock_and_tracking_atomically(self):
+        """An approval-only user can apply validated unknown-product setup."""
+        approval = self.create_request(ScanStockApprovalRequest.Direction.INBOUND)
+        barcode = 'APPROVED-NEW-IPN'
+        self.post(
+            reverse('api-stock-scan-inbound-v2'),
+            {
+                'barcode': barcode,
+                'client_event_id': str(uuid.uuid4()),
+                'quantity': '3',
+                'destination_location': self.location.pk,
+                'approval_request_id': approval['pk'],
+                'create_part': {
+                    'name': 'Approved new product',
+                    'description': '',
+                    'category': None,
+                    'default_location': self.location.pk,
+                },
+            },
+            expected_code=201,
+        )
+        self.assertFalse(Part.objects.filter(IPN=barcode).exists())
+        self.post(
+            reverse('api-stock-scan-request-submit', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        )
+        self.client.force_authenticate(user=self.approver)
+        completed = self.post(
+            reverse('api-stock-scan-request-approve', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        ).data
+
+        part = Part.objects.get(IPN=barcode)
+        item = StockItem.objects.get(part=part, location=self.location)
+        event = ScanStockEvent.objects.get(approval_request_id=approval['pk'])
+        self.assertEqual(completed['status'], ScanStockApprovalRequest.Status.COMPLETED)
+        self.assertEqual(item.quantity, 3)
+        self.assertEqual(event.outcome, ScanStockEvent.Outcome.SUCCESS)
+        self.assertEqual(StockItemTracking.objects.filter(scan_event=event).count(), 1)
+
+    def test_enabled_switch_blocks_legacy_direct_mutation(self):
+        """Old clients cannot bypass approval when the feature is enabled."""
+        response = self.post(
+            reverse('api-stock-scan-outbound'),
+            {
+                'barcode': f'INV-SI{self.item.pk}',
+                'client_event_id': str(uuid.uuid4()),
+                'source_location': self.location.pk,
+            },
+            expected_code=409,
+        ).data
+        self.item.refresh_from_db()
+        self.assertEqual(response['error_code'], 'APPROVAL_REQUEST_REQUIRED')
+        self.assertEqual(self.item.quantity, 5)
+        self.assertFalse(ScanStockEvent.objects.exists())
+
+    def test_native_allocations_and_stock_mutations_respect_freeze(self):
+        """Allocation expansion and direct semantic writes cannot consume a freeze."""
+        customer = company.models.Company.objects.create(
+            name='Approval allocation customer', is_customer=True
+        )
+        sales_order = order.models.SalesOrder.objects.create(
+            reference='SO-SCAN-FREEZE', customer=customer
+        )
+        sales_line = order.models.SalesOrderLineItem.objects.create(
+            order=sales_order, part=self.part, quantity=5
+        )
+        sales_allocation = order.models.SalesOrderAllocation.objects.create(
+            line=sales_line, item=self.item, quantity=1
+        )
+
+        approval = self.create_request(ScanStockApprovalRequest.Direction.OUTBOUND)
+        self.post(
+            reverse('api-stock-scan-outbound'),
+            {
+                'barcode': f'INV-SI{self.item.pk}',
+                'client_event_id': str(uuid.uuid4()),
+                'quantity': '4',
+                'source_location': self.location.pk,
+                'approval_request_id': approval['pk'],
+            },
+            expected_code=201,
+        )
+
+        with self.assertRaises(ValidationError):
+            set_global_setting('SCAN_APPROVAL_ENABLED', False)
+
+        sales_allocation.quantity = 2
+        with self.assertRaises(ValidationError):
+            sales_allocation.full_clean()
+
+        transfer_order = order.models.TransferOrder.objects.create(
+            reference='TO-SCAN-FREEZE'
+        )
+        transfer_line = order.models.TransferOrderLineItem.objects.create(
+            order=transfer_order, part=self.part, quantity=1
+        )
+        with self.assertRaises(ValidationError):
+            order.models.TransferOrderAllocation(
+                line=transfer_line, item=self.item, quantity=1
+            ).full_clean()
+
+        self.item.refresh_from_db()
+        self.item.status = StockStatus.QUARANTINED.value
+        with self.assertRaises(ValidationError):
+            self.item.save()
+
+        self.item.refresh_from_db()
+        self.item.quantity = 4
+        with self.assertRaises(ValidationError):
+            self.item.save()
+
+        self.item.refresh_from_db()
+        with self.assertRaises(ValidationError):
+            self.item.delete()
+
+    def test_scan_retry_replays_after_request_submission(self):
+        """Mutable request state does not invalidate an already accepted UUID."""
+        approval = self.create_request(ScanStockApprovalRequest.Direction.OUTBOUND)
+        payload = {
+            'barcode': f'INV-SI{self.item.pk}',
+            'client_event_id': str(uuid.uuid4()),
+            'quantity': '2',
+            'source_location': self.location.pk,
+            'approval_request_id': approval['pk'],
+        }
+        self.post(
+            reverse('api-stock-scan-outbound'), payload, expected_code=201
+        )
+        self.post(
+            reverse('api-stock-scan-request-submit', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        )
+
+        replay = self.post(
+            reverse('api-stock-scan-outbound'), payload, expected_code=200
+        ).data
+        event = ScanStockEvent.objects.get(client_event_id=payload['client_event_id'])
+        self.assertTrue(replay['replayed'])
+        self.assertEqual(event.replay_count, 1)
+        self.assertEqual(self.item.scan_frozen_quantity(), 2)
+
+    def test_approval_rejects_barcode_remapped_to_another_part(self):
+        """A known inbound line cannot silently follow a changed barcode mapping."""
+        self.item.location = None
+        self.item.save()
+        approval = self.create_request(ScanStockApprovalRequest.Direction.INBOUND)
+        barcode = self.part.IPN
+        self.post(
+            reverse('api-stock-scan-inbound-v2'),
+            {
+                'barcode': barcode,
+                'client_event_id': str(uuid.uuid4()),
+                'quantity': '2',
+                'destination_location': self.location.pk,
+                'approval_request_id': approval['pk'],
+            },
+            expected_code=201,
+        )
+        event = ScanStockEvent.objects.get(approval_request_id=approval['pk'])
+        self.assertEqual(event.part_id, self.part.pk)
+        self.assertIsNone(event.stock_item_id)
+
+        self.post(
+            reverse('api-stock-scan-request-submit', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=200,
+        )
+        self.part.IPN = 'APPROVAL-OLD-IPN'
+        self.part.save()
+        replacement = Part.objects.create(name='Remapped product', IPN=barcode)
+
+        self.client.force_authenticate(user=self.approver)
+        response = self.post(
+            reverse('api-stock-scan-request-approve', kwargs={'pk': approval['pk']}),
+            {},
+            expected_code=409,
+        ).data
+
+        self.assertEqual(response['error_code'], 'APPROVAL_PART_MISMATCH')
+        self.assertFalse(
+            StockItem.objects.filter(part=replacement, location=self.location).exists()
+        )
+        self.assertEqual(
+            ScanStockApprovalRequest.objects.get(pk=approval['pk']).status,
+            ScanStockApprovalRequest.Status.PENDING_APPROVAL,
+        )
 
 
 class StockLocationTest(StockAPITestCase):

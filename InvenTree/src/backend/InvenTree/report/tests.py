@@ -1,6 +1,7 @@
 """Unit testing for the various report models."""
 
 import os
+import re
 import socket
 import tempfile
 from io import StringIO
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from django.apps import apps
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.test import TestCase
@@ -27,6 +29,8 @@ from order.models import PurchaseOrder, ReturnOrder, SalesOrder
 from part.models import Part
 from plugin.registry import registry
 from report.models import LabelTemplate, ReportTemplate
+from report.serializers import LabelPrintSerializer
+from report.templatetags.barcode import qrcode
 from stock.models import StockItem
 
 
@@ -446,6 +450,150 @@ class LabelTest(InvenTreeAPITestCase):
         self.assertIsNotNone(output.output)
         self.assertEqual(output.plugin, 'inventreelabel')
         self.assertTrue(output.output.name.endswith('.pdf'))
+
+    def test_product_ipn_label_registration(self):
+        """The product IPN label is available for both parts and stock items."""
+        templates = LabelTemplate.objects.filter(
+            name=report_models.PRODUCT_IPN_LABEL_NAME
+        )
+
+        self.assertEqual(
+            set(templates.values_list('model_type', flat=True)), {'part', 'stockitem'}
+        )
+        self.assertEqual(templates.values('template').distinct().count(), 2)
+
+        for template in templates:
+            self.assertEqual(template.width, 50)
+            self.assertEqual(template.height, 30)
+            self.assertIn('not a stock item code', template.description)
+            self.assertTrue(template.is_product_ipn_label)
+
+    def test_product_ipn_label_payload(self):
+        """Part and stock item product labels encode only the normalized IPN."""
+        self.ensurePluginsLoaded()
+
+        ipn = 'PRODUCT-IPN-42'
+        Part.objects.filter(pk=100).update(IPN=f'  {ipn}  ')
+
+        part = Part.objects.get(pk=100)
+        stock_item = StockItem.objects.select_related('part').get(pk=1000)
+        expected_qr = qrcode(ipn, border=4, error_correction='M')
+
+        for model_type, item in [('part', part), ('stockitem', stock_item)]:
+            with self.subTest(model_type=model_type):
+                template = LabelTemplate.objects.get(
+                    name=report_models.PRODUCT_IPN_LABEL_NAME, model_type=model_type
+                )
+                html = template.render_as_string(item)
+                match = re.search(r"class='product-qr'[^>]+src='([^']+)'", html)
+
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), expected_qr)
+                self.assertNotEqual(
+                    match.group(1), qrcode(item.barcode, border=4, error_correction='M')
+                )
+                self.assertIn(part.name, html)
+                self.assertIn(ipn, html)
+                self.assertIn('IPN:', html)
+                self.assertIn('广州南沙智慧城市大数据有限公司', html)
+                self.assertNotIn('not a stock item code', html)
+                self.assertNotIn('内部零件号', html)
+
+    def test_product_ipn_label_rejects_blank_ipn(self):
+        """Product labels report every selected part or stock item without an IPN."""
+        self.ensurePluginsLoaded()
+
+        Part.objects.filter(pk=100).update(IPN='  ')
+        part = Part.objects.get(pk=100)
+        stock_item = StockItem.objects.select_related('part').get(pk=1000)
+        url = reverse('api-label-print')
+
+        for model_type, item in [('part', part), ('stockitem', stock_item)]:
+            with self.subTest(model_type=model_type):
+                template = LabelTemplate.objects.get(
+                    name=report_models.PRODUCT_IPN_LABEL_NAME, model_type=model_type
+                )
+
+                with self.assertRaises(ValidationError) as error:
+                    template.validate_print_request([item])
+
+                object_reference = f'{item._meta.verbose_name} #{item.pk}'
+                self.assertIn(object_reference, str(error.exception))
+
+                response = self.post(
+                    url,
+                    {'template': template.pk, 'items': [item.pk]},
+                    expected_code=400,
+                )
+                self.assertIn(object_reference, str(response.data['items']))
+
+    def test_label_print_copies_and_batch_limit(self):
+        """Copies work for batch labels and are capped at 500 labels per job."""
+        self.ensurePluginsLoaded()
+
+        part_one = Part.objects.get(pk=100)
+        part_two = Part.objects.get(pk=10002)
+        template = LabelTemplate.objects.get(
+            name=report_models.PRODUCT_IPN_LABEL_NAME, model_type='part'
+        )
+
+        for copies, valid in [(0, False), (1, True), (500, True), (501, False)]:
+            with self.subTest(copies=copies):
+                serializer = LabelPrintSerializer(
+                    data={
+                        'template': template.pk,
+                        'items': [part_one.pk],
+                        'copies': copies,
+                    }
+                )
+                self.assertEqual(serializer.is_valid(), valid)
+
+        with patch('InvenTree.tasks.offload_task') as offload:
+            response = self.post(
+                reverse('api-label-print'),
+                {
+                    'template': template.pk,
+                    'items': [part_one.pk, part_two.pk],
+                    'copies': 2,
+                },
+                expected_code=201,
+            )
+
+        self.assertEqual(response.data['total'], 4)
+        self.assertEqual(offload.call_args.args[2], [part_one.pk, part_two.pk])
+        self.assertEqual(offload.call_args.kwargs['copies'], 2)
+
+        with patch('InvenTree.tasks.offload_task') as offload:
+            response = self.post(
+                reverse('api-label-print'),
+                {
+                    'template': template.pk,
+                    'items': [part_one.pk, part_two.pk],
+                    'copies': 251,
+                },
+                expected_code=400,
+            )
+
+        self.assertIn('limited to 500 labels', str(response.data['copies']))
+        offload.assert_not_called()
+
+    def test_label_print_expands_copies_for_plugins(self):
+        """Each selected item is sent to the label plugin once per copy."""
+        self.ensurePluginsLoaded()
+
+        part = Part.objects.get(pk=100)
+        template = LabelTemplate.objects.get(
+            name=report_models.PRODUCT_IPN_LABEL_NAME, model_type='part'
+        )
+        plugin = registry.get_plugin('inventreelabel')
+        self.assertIsNotNone(plugin)
+
+        with patch.object(plugin, 'print_labels') as print_labels:
+            output = template.print([part], plugin=plugin, copies=2)
+
+        self.assertEqual(output.total, 2)
+        printed_items = print_labels.call_args.args[2]
+        self.assertEqual([item.pk for item in printed_items], [part.pk, part.pk])
 
     def test_print_custom_template(self):
         """Test printing against a custom template file."""

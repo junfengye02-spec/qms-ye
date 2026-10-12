@@ -102,13 +102,13 @@ class TemplateTagTest(InvenTreeTestCase):
         """Test the 'setting_object' template tag."""
         # Normal
         self.assertEqual(
-            inventree_extras.setting_object('PART_ALLOW_DUPLICATE_IPN').value, True
+            inventree_extras.setting_object('PART_ALLOW_EDIT_IPN').value, True
         )
 
         # User
         self.assertEqual(
             inventree_extras.setting_object(
-                'PART_ALLOW_DUPLICATE_IPN', user=self.user
+                'PART_ALLOW_EDIT_IPN', user=self.user
             ).value,
             '',
         )
@@ -116,7 +116,7 @@ class TemplateTagTest(InvenTreeTestCase):
         # Method
         self.assertEqual(
             inventree_extras.setting_object(
-                'PART_ALLOW_DUPLICATE_IPN', method='abc', user=self.user
+                'PART_ALLOW_EDIT_IPN', method='abc', user=self.user
             ).value,
             '',
         )
@@ -125,17 +125,17 @@ class TemplateTagTest(InvenTreeTestCase):
         """Test the 'settings_value' template tag."""
         # Normal
         self.assertEqual(
-            inventree_extras.settings_value('PART_ALLOW_DUPLICATE_IPN'), True
+            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN'), True
         )
 
         # User
         self.assertEqual(
-            inventree_extras.settings_value('PART_ALLOW_DUPLICATE_IPN', user=self.user),
+            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN', user=self.user),
             '',
         )
         self.logout()
         self.assertEqual(
-            inventree_extras.settings_value('PART_ALLOW_DUPLICATE_IPN', user=self.user),
+            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN', user=self.user),
             '',
         )
 
@@ -793,7 +793,7 @@ class PartSettingsTest(InvenTreeTestCase):
             Part.objects.filter(pk=part.pk).delete()
 
     def test_duplicate_ipn(self):
-        """Test the setting which controls duplicate IPN values."""
+        """IPN values are globally unique and case insensitive."""
         # Create a part
         Part.objects.create(
             name='Hello', description='A thing', IPN='IPN123', revision='A'
@@ -804,21 +804,8 @@ class PartSettingsTest(InvenTreeTestCase):
             part = Part(name='Hello', description='A thing', IPN='IPN123', revision='A')
             part.validate_unique()
 
-        # Attempt to create item with duplicate IPN (should be allowed by default)
-        Part.objects.create(
-            name='Hello', description='A thing', IPN='IPN123', revision='B'
-        )
-
-        # And attempt again with the same values (should fail)
         with self.assertRaises(ValidationError):
-            part = Part(name='Hello', description='A thing', IPN='IPN123', revision='B')
-            part.validate_unique()
-
-        # Now update the settings so duplicate IPN values are *not* allowed
-        set_global_setting('PART_ALLOW_DUPLICATE_IPN', False, self.user)
-
-        with self.assertRaises(ValidationError):
-            part = Part(name='Hello', description='A thing', IPN='IPN123', revision='C')
+            part = Part(name='Other', description='A thing', IPN='IPN123', revision='B')
             part.full_clean()
 
         # Any duplicate IPN should raise an error

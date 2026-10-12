@@ -191,9 +191,12 @@ class LabelPrint(GenericAPIView):
         if len(instances) == 0:
             raise ValidationError(_('No valid items provided to template'))
 
-        return self.print(template, instances, plugin, request)
+        copies = serializer.validated_data['copies']
+        template.validate_print_request(instances, copies=copies)
 
-    def print(self, template, items_to_print, plugin, request):
+        return self.print(template, instances, plugin, request, copies=copies)
+
+    def print(self, template, items_to_print, plugin, request, copies=1):
         """Print this label template against a number of provided items."""
         import report.tasks
         from InvenTree.tasks import offload_task
@@ -203,12 +206,15 @@ class LabelPrint(GenericAPIView):
         ):
             plugin_serializer.is_valid(raise_exception=True)
 
+        printing_options = dict(plugin_serializer.data) if plugin_serializer else {}
+        printing_options.pop('copies', None)
+
         user = getattr(request, 'user', None)
 
         # Generate a new DataOutput object to print against
         output = DataOutput.objects.create(
             user=user if user and user.is_authenticated else None,
-            total=len(items_to_print),
+            total=len(items_to_print) * copies,
             progress=0,
             complete=False,
             output_type=DataOutput.DataOutputTypes.LABEL,
@@ -226,7 +232,8 @@ class LabelPrint(GenericAPIView):
             output.pk,
             user.pk if user else None,
             plugin.slug,
-            options=(plugin_serializer.data if plugin_serializer else {}),
+            options=printing_options,
+            copies=copies,
         )
 
         output.refresh_from_db()
@@ -382,6 +389,7 @@ class ReportAssetDetail(TemplatePermissionMixin, RetrieveUpdateDestroyAPI):
 
 
 label_api_urls = [
+    path('local/', include('report.local_print_api')),
     # Printing endpoint
     path('print/', LabelPrint.as_view(), name='api-label-print'),
     # Label templates

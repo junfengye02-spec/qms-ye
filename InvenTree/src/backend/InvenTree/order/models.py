@@ -2886,8 +2886,30 @@ class SalesOrderShipment(
         order = self.order
         customer = order.customer
 
-        # Preselect related fields to avoid per-row database queries below
-        allocations = allocations.select_related('line', 'item', 'item__part')
+        # Lock allocation rows, then every referenced StockItem in primary-key
+        # order. The shipment bulk path bypasses StockItem.save(), so it must
+        # enforce the same native-allocation + scan-freeze invariant itself.
+        allocations = list(
+            allocations.select_for_update()
+            .select_related('line', 'item', 'item__part')
+            .order_by('item_id', 'pk')
+        )
+        stock_item_ids = sorted({allocation.item_id for allocation in allocations})
+        locked_stock_items = {
+            item.pk: item
+            for item in stock.models.StockItem.objects.select_for_update()
+            .select_related('part')
+            .filter(pk__in=stock_item_ids)
+            .order_by('pk')
+        }
+        if len(locked_stock_items) != len(stock_item_ids):
+            raise ValidationError(_('Allocated stock item no longer exists'))
+        remaining_allocated = stock.models.StockItem.bulk_allocation_count(
+            locked_stock_items.values()
+        )
+        frozen_quantities = stock.models.StockItem.bulk_scan_frozen_quantity(
+            locked_stock_items.values()
+        )
 
         split_items = []  # (source_item, new_item, quantity) - stock to split off
         shipped_items = []  # (target_item, quantity) - stock to mark as shipped
@@ -2903,8 +2925,25 @@ class SalesOrderShipment(
         allocations_to_update = []
 
         for allocation in allocations:
-            stock_item = seen_stock_items.get(allocation.item_id) or allocation.item
+            stock_item = (
+                seen_stock_items.get(allocation.item_id)
+                or locked_stock_items[allocation.item_id]
+            )
             quantity = allocation.quantity
+
+            other_allocated = max(
+                remaining_allocated.get(stock_item.pk, Decimal(0)) - quantity,
+                Decimal(0),
+            )
+            required_remainder = other_allocated + frozen_quantities.get(
+                stock_item.pk, Decimal(0)
+            )
+            if stock_item.quantity - quantity < required_remainder:
+                raise ValidationError(
+                    _(
+                        'Shipment would consume stock reserved by another allocation or scan approval request'
+                    )
+                )
 
             seen_stock_items[stock_item.pk] = stock_item
 
@@ -2938,6 +2977,10 @@ class SalesOrderShipment(
             line = seen_lines.get(allocation.line_id) or allocation.line
             line.shipped += quantity
             seen_lines[line.pk] = line
+            remaining_allocated[stock_item.pk] = max(
+                remaining_allocated.get(stock_item.pk, Decimal(0)) - quantity,
+                Decimal(0),
+            )
 
         # Nothing to do?
         if not seen_stock_items:
@@ -2984,6 +3027,7 @@ class SalesOrderShipment(
                     part_id=new_item.part_id,
                     tracking_type=StockHistoryCode.SPLIT_FROM_PARENT.value,
                     user=user,
+                    **UserModels.operator_snapshot(user),
                     deltas={'stockitem': source_item.pk, 'quantity': float(quantity)},
                 )
             )
@@ -2993,6 +3037,7 @@ class SalesOrderShipment(
                     part_id=source_item.part_id,
                     tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
                     user=user,
+                    **UserModels.operator_snapshot(user),
                     deltas={
                         'removed': float(quantity),
                         'quantity': float(source_item.quantity),
@@ -3016,6 +3061,7 @@ class SalesOrderShipment(
                     part_id=target_item.part_id,
                     tracking_type=StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER.value,
                     user=user,
+                    **UserModels.operator_snapshot(user),
                     deltas=deltas,
                 )
             )
@@ -3198,6 +3244,7 @@ class SalesOrderAllocation(models.Model):
             build_allocation_count
             + sales_allocation_count
             + transfer_allocation_count
+            + self.item.scan_frozen_quantity()
             + self.quantity
         )
 
@@ -4306,6 +4353,7 @@ class TransferOrderAllocation(models.Model):
             build_allocation_count
             + sales_allocation_count
             + transfer_allocation_count
+            + self.item.scan_frozen_quantity()
             + self.quantity
         )
 
@@ -4404,6 +4452,10 @@ class TransferOrderAllocation(models.Model):
                 user=user,
                 code=StockHistoryCode.STOCK_REMOVE,
                 transferorder=order,
+                # This exact transfer allocation is fulfilled in the same
+                # transaction. Other native allocations and every scan freeze
+                # remain protected by StockItem.take_stock().
+                allocation_credit=transfer_quantity,
             ):
                 raise ValidationError(
                     _('Failed to consume stock item against transfer order')

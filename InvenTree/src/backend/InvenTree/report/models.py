@@ -3,6 +3,7 @@
 import io
 import os
 import sys
+import uuid
 from datetime import date, datetime
 from typing import Optional, TypedDict, cast
 
@@ -47,6 +48,11 @@ except OSError as err:  # pragma: no cover
 
 
 logger = structlog.getLogger('inventree')
+
+PRODUCT_IPN_LABEL_FILENAME = 'product_ipn_qr.html'
+PRODUCT_IPN_LABEL_NAME = 'Product IPN QR Code Label'
+PRODUCT_IPN_LABEL_DESCRIPTION = 'Product QR label by IPN (not a stock item code)'
+MAX_LABELS_PER_PRINT = 500
 
 
 def log_report_error(*args, **kwargs):
@@ -127,9 +133,9 @@ class TemplateUploadMixin:
         exists = self.__class__.objects.filter(**filters).exclude(pk=self.pk).exists()
 
         if exists and raise_error:
-            raise ValidationError({
-                self.TEMPLATE_FIELD: _('Template file with this name already exists')
-            })
+            raise ValidationError(
+                {self.TEMPLATE_FIELD: _('Template file with this name already exists')}
+            )
 
         return exists
 
@@ -651,10 +657,9 @@ class ReportTemplate(TemplateUploadMixin, ReportTemplateBase):
 
             # Raise a ValidationError with the error message
             # This will be caught by the caller and displayed to the user
-            raise ValidationError({
-                'error': _('Error generating report'),
-                'detail': str(exc),
-            })
+            raise ValidationError(
+                {'error': _('Error generating report'), 'detail': str(exc)}
+            )
 
         if not report_name:
             report_name = ''  # pragma: no cover
@@ -749,6 +754,60 @@ class LabelTemplate(TemplateUploadMixin, ReportTemplateBase):
         }}
         """
 
+    @property
+    def is_product_ipn_label(self) -> bool:
+        """Return whether this is the built-in product IPN label template."""
+        filename = os.path.basename(self.template.name)
+
+        return self.name == PRODUCT_IPN_LABEL_NAME or filename.startswith(
+            os.path.splitext(PRODUCT_IPN_LABEL_FILENAME)[0]
+        )
+
+    def validate_print_request(self, items: list, copies: int = 1) -> None:
+        """Validate label items and copy limits before creating a print job."""
+        if isinstance(copies, bool) or not isinstance(copies, int):
+            raise ValidationError({'copies': _('Copies must be a whole number')})
+
+        if copies < 1 or copies > MAX_LABELS_PER_PRINT:
+            raise ValidationError(
+                {
+                    'copies': _('Copies must be between 1 and %(maximum)s')
+                    % {'maximum': MAX_LABELS_PER_PRINT}
+                }
+            )
+
+        if len(items) * copies > MAX_LABELS_PER_PRINT:
+            raise ValidationError(
+                {
+                    'copies': _(
+                        'A single print request is limited to %(maximum)s labels'
+                    )
+                    % {'maximum': MAX_LABELS_PER_PRINT}
+                }
+            )
+
+        if not self.is_product_ipn_label:
+            return
+
+        missing_ipn = []
+
+        for item in items:
+            part = getattr(item, 'part', item)
+            ipn = str(getattr(part, 'IPN', '') or '').strip()
+
+            if not ipn:
+                missing_ipn.append(f'{item._meta.verbose_name} #{item.pk} ({item})')
+
+        if missing_ipn:
+            raise ValidationError(
+                {
+                    'items': _(
+                        'Cannot print the Product IPN QR Code label because these objects have no IPN: %(items)s'
+                    )
+                    % {'items': ', '.join(missing_ipn)}
+                }
+            )
+
     def get_context(self, instance: models.Model, *args, **kwargs):
         """Supply context data to the label template for rendering.
 
@@ -766,6 +825,13 @@ class LabelTemplate(TemplateUploadMixin, ReportTemplateBase):
         }
 
         context = {**base_context, **label_context}
+
+        if self.is_product_ipn_label:
+            part = getattr(instance, 'part', instance)
+            context['product_ipn'] = str(getattr(part, 'IPN', '') or '').strip()
+            context['product_revision'] = str(
+                getattr(part, 'revision', '') or ''
+            ).strip()
 
         if kwargs.pop('insert_page_style', True):
             context['page_style'] = self.generate_page_style()
@@ -789,6 +855,7 @@ class LabelTemplate(TemplateUploadMixin, ReportTemplateBase):
         output: Optional[DataOutput] = None,
         options: Optional[dict] = None,
         user: Optional[AbstractUser] = None,
+        copies: int = 1,
         **kwargs,
     ) -> DataOutput:
         """Print labels for a list of items against this template.
@@ -799,6 +866,7 @@ class LabelTemplate(TemplateUploadMixin, ReportTemplateBase):
             output: The DataOutput object to use
             options: Additional options for the label printing plugin (optional)
             user: The user to associate with the generated labels
+            copies: Number of copies to print for each selected item
 
         Returns:
             output: The DataOutput object representing the generated label(s)
@@ -806,6 +874,17 @@ class LabelTemplate(TemplateUploadMixin, ReportTemplateBase):
         Raises:
             ValidationError: If there is an error during label printing
         """
+        items = list(items)
+
+        try:
+            self.validate_print_request(items, copies=copies)
+        except ValidationError:
+            if output:
+                output.delete()
+            raise
+
+        items = [item for item in items for _copy in range(copies)]
+
         logger.info(
             f"Printing {len(items)} labels against template '{self.name}' using plugin '{plugin.slug}'"
         )
@@ -849,6 +928,65 @@ class LabelTemplate(TemplateUploadMixin, ReportTemplateBase):
 
         # Return the output object
         return output
+
+
+class LocalPrintJob(models.Model):
+    """Audit a browser-to-local-queue attempt independently of PDF generation."""
+
+    class State(models.TextChoices):
+        """Submission is not evidence of physical printing."""
+
+        GENERATING = 'generating'
+        READY = 'ready'
+        SUBMITTING = 'submitting'
+        SUBMITTED = 'submitted'
+        FAILED = 'failed'
+        UNCERTAIN = 'uncertain'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL
+    )
+    request_key = models.UUIDField()
+    request_hash = models.CharField(max_length=64)
+    item_versions = models.JSONField(default=dict, blank=True)
+    model_type = models.CharField(max_length=20)
+    items = models.JSONField()
+    copies = models.PositiveIntegerField()
+    item_copies = models.JSONField(default=dict, blank=True)
+    queue = models.CharField(max_length=255)
+    template = models.ForeignKey(LabelTemplate, null=True, on_delete=models.SET_NULL)
+    template_name = models.CharField(max_length=100)
+    output = models.ForeignKey(DataOutput, null=True, on_delete=models.SET_NULL)
+    file_sha256 = models.CharField(max_length=64, blank=True)
+    state = models.CharField(
+        max_length=20, choices=State.choices, default=State.GENERATING
+    )
+    detail = models.CharField(max_length=500, blank=True)
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+    expires = models.DateTimeField()
+    claimed = models.DateTimeField(null=True)
+    submitted = models.DateTimeField(null=True)
+    original = models.ForeignKey('self', null=True, on_delete=models.SET_NULL)
+
+    def copies_for(self, item_id):
+        """Return the durable copy count for one selected object."""
+        return self.item_copies.get(str(item_id), self.copies)
+
+    @property
+    def total_labels(self):
+        """Count all pages, including tasks created before per-item quantities."""
+        return sum(self.copies_for(item_id) for item_id in self.items)
+
+    class Meta:
+        """Deduplicate independently for each authenticated operator."""
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'request_key'], name='local_print_user_request'
+            )
+        ]
 
 
 class ReportSnippet(TemplateUploadMixin, models.Model):

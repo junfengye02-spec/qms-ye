@@ -133,6 +133,8 @@ def get_ruleset_models() -> dict:
             'stock_stockitem',
             'stock_stockitemtracking',
             'stock_stockitemtestresult',
+            'stock_scanstockapprovalrequest',
+            'stock_scanstockevent',
         ],
         RuleSetEnum.PURCHASE_ORDER: [
             'company_company',

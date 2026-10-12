@@ -1,0 +1,26 @@
+{% extends "label/label_base.html" %}
+{% load l10n i18n barcode %}
+{% block style %}
+    .complete-label { position: relative; width: 50mm; height: 30mm; color: #000; background: #fff; font-family: sans-serif; }
+    .complete-qr { position: absolute; left: 0; top: 0.5mm; width: 26mm; height: 26mm; }
+    .complete-text { position: absolute; left: 27mm; top: 2.7mm; right: 2.5mm; font-size: 5pt; line-height: 1.15; overflow-wrap: anywhere; }
+    .complete-text.long { font-size: 3.2pt; line-height: 1.05; }
+    .complete-text.extended { font-size: 2.7pt; line-height: 1.05; }
+    .complete-name { font-weight: bold; font-size: 1.1em; margin-bottom: 0.5mm; }
+    .complete-field { margin-bottom: 0.6mm; }
+    .complete-company { position: absolute; left: 2.5mm; right: 2.5mm; bottom: 0.8mm; padding-top: 0.5mm; border-top: 0.1mm solid #aaa; text-align: center; font-size: 5pt; line-height: 1; white-space: nowrap; }
+{% endblock style %}
+{% block content %}
+    <div class="complete-label">
+        <img class="complete-qr"
+             alt="{% trans 'Complete receipt QR code' %}"
+             src="{% qrcode complete_barcode border=4 error_correction='H' optimize=0 %}">
+        <div class="complete-text{% if detail.project|length > 70 or detail.contract.number|length > 70 or part.name|length > 70 or part.IPN|length > 70 %} extended{% elif detail.project|length > 30 or detail.contract.number|length > 30 or part.name|length > 30 or part.IPN|length > 30 %} long{% endif %}">
+            <div class="complete-name">{{ part.name }}</div>
+            <div class="complete-field">设备编号：{% if part.IPN %}{{ part.IPN }}{% else %}{{ part.barcode }}{% endif %}</div>
+            <div class="complete-field">项目：{{ detail.project }}</div>
+            <div class="complete-field">合同：{{ detail.contract.number }}</div>
+        </div>
+        <div class="complete-company">广州南沙智慧城市大数据有限公司</div>
+    </div>
+{% endblock content %}

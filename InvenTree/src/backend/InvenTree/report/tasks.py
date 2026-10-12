@@ -117,5 +117,8 @@ def print_labels(
 
     # Extract optional arguments for label printing
     options = kwargs.pop('options') or {}
+    copies = kwargs.pop('copies', 1)
 
-    template.print(items, plugin, output=output, user=user, options=options)
+    template.print(
+        items, plugin, output=output, user=user, options=options, copies=copies
+    )

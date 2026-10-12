@@ -219,6 +219,18 @@ class RolePermission(InvenTreeRoleScopeMixin, permissions.BasePermission):
         if user.is_superuser:
             return True
 
+        # Warehouse users must change stock through the approval workflow.
+        if (
+            not user.is_staff
+            and request.method not in permissions.SAFE_METHODS
+            and type(view).__module__ == 'stock.api'
+            and not getattr(view, 'approval_workflow', False)
+        ):
+            from common.settings import get_global_setting
+
+            if get_global_setting('SCAN_APPROVAL_ENABLED', False):
+                return False
+
         # Map the request method to a permission type
         rolemap = {**ACTION_MAP, 'OPTIONS': 'view'}
 

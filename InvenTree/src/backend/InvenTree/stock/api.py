@@ -14,7 +14,11 @@ from django_filters.rest_framework.filterset import FilterSet
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_field
 from rest_framework import status
+from rest_framework.authentication import BasicAuthentication, SessionAuthentication
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.generics import GenericAPIView
+from rest_framework.pagination import LimitOffsetPagination
+from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.serializers import ValidationError
 
@@ -65,13 +69,26 @@ from part.models import BomItem, Part, PartCategory
 from part.serializers import PartBriefSerializer
 from stock.generators import generate_batch_code, generate_serial_number
 from stock.models import (
+    ScanStockApprovalRequest,
+    ScanStockEvent,
     StockItem,
     StockItemTestResult,
     StockItemTracking,
     StockLocation,
     StockLocationType,
 )
+from stock.services import (
+    ApprovalRequestService,
+    ScanApprovalError,
+    ScanStockIdempotencyConflict,
+    ScanStockPreflight,
+    ScanStockService,
+)
 from stock.status_codes import StockHistoryCode, StockStatus
+from users.authentication import ApiTokenAuthentication, ExtendedOAuth2Authentication
+from users.models import Owner
+from users.oauth2_scopes import get_granular_scope
+from users.permissions import check_user_permission
 
 
 class GenerateBatchCode(GenericAPIView):
@@ -104,6 +121,596 @@ class GenerateSerialNumber(GenericAPIView):
         data = {'serial_number': generate_serial_number(**serializer.validated_data)}
 
         return Response(data, status=status.HTTP_201_CREATED)
+
+
+class ScanInboundPagination(LimitOffsetPagination):
+    """Bounded pagination for the recent scan inbound audit trail."""
+
+    default_limit = 50
+    max_limit = 200
+
+
+class ScanStockApprovalRolePermission(InvenTree.permissions.RolePermission):
+    """Apply stock roles without overriding approval-domain permissions."""
+
+    def has_permission(self, request, view):
+        """Allow stock roles or the explicit approval permissions for this view."""
+        if super().has_permission(request, view):
+            return True
+
+        user = request.user
+        if request.method in SAFE_METHODS:
+            return user.has_perm(
+                ApprovalRequestService.APPROVE_PERMISSION
+            ) or user.has_perm(ApprovalRequestService.AUDIT_PERMISSION)
+
+        service_permission = getattr(view, 'approval_service_permission', None)
+        if service_permission == 'approve':
+            return user.has_perm(ApprovalRequestService.APPROVE_PERMISSION)
+        # The service checks requester / auditor identity against the locked row.
+        return service_permission == 'authenticated'
+
+
+class ScanStockTokenMatchesOASRequirements(
+    InvenTree.permissions.InvenTreeTokenMatchesOASRequirements
+):
+    """Require declared scopes for OAuth while retaining normal login access."""
+
+    def has_permission(self, request, view):
+        """Do not let the base permission fallback bypass a failed OAuth scope."""
+        if self.is_oauth2ed(request):
+            return self.check_oauth2_authentication(request, view)
+        return bool(request.user and request.user.is_authenticated)
+
+
+SCAN_STOCK_AUTHENTICATION_CLASSES = [
+    ExtendedOAuth2Authentication,
+    ApiTokenAuthentication,
+    BasicAuthentication,
+    SessionAuthentication,
+]
+
+
+class ScanStockActionView(GenericAPIView):
+    """Shared transactional endpoint for inbound and outbound stock scans."""
+
+    queryset = ScanStockEvent.objects.none()
+    serializer_class = StockSerializers.ScanStockRequestSerializer
+    pagination_class = ScanInboundPagination
+    authentication_classes = SCAN_STOCK_AUTHENTICATION_CLASSES
+    # This is a domain action, not creation of a ScanStockEvent by the caller.
+    # Exclude the default ModelPermission so POST is governed by stock.change.
+    approval_workflow = True
+    permission_classes = [
+        IsAuthenticated,
+        InvenTree.permissions.RolePermission,
+        ScanStockTokenMatchesOASRequirements,
+    ]
+    role_required = 'stock'
+    rolemap = {'GET': 'view', 'POST': 'change'}
+    operation = None
+    required_alternate_scopes = InvenTree.permissions.map_scope(roles=['stock'])
+    required_alternate_scopes['POST'] = [[get_granular_scope('change', 'stock')]]
+
+    def get_serializer_class(self):
+        """Expose event fields for GET metadata and scan input fields for POST."""
+        if self.request.method == 'GET':
+            return StockSerializers.ScanStockEventSerializer
+        return StockSerializers.ScanStockRequestSerializer
+
+    def get_serializer_context(self):
+        """Provide the endpoint operation to the shared envelope serializer."""
+        return {**super().get_serializer_context(), 'operation': self.operation}
+
+    @extend_schema(responses=StockSerializers.ScanStockEventSerializer(many=True))
+    def get(self, request, *args, **kwargs):
+        """Return recent events for this direction (legacy compatibility)."""
+        queryset = ScanStockEvent.objects.filter(operation=self.operation).order_by(
+            '-scanned_at', '-pk'
+        )
+        page = self.paginate_queryset(queryset)
+        serializer = StockSerializers.ScanStockEventSerializer(
+            page, many=True, context=self.get_serializer_context()
+        )
+        return self.get_paginated_response(serializer.data)
+
+    @extend_schema(
+        request=StockSerializers.ScanStockRequestSerializer,
+        responses={
+            200: StockSerializers.ScanStockEventSerializer,
+            201: StockSerializers.ScanStockEventSerializer,
+        },
+    )
+    def post(self, request, *args, **kwargs):
+        """Process one idempotent stock scan."""
+        if request.data.get('create_part') is not None and not (
+            check_user_permission(request.user, Part, 'add')
+            and check_user_permission(request.user, StockItem, 'add')
+        ):
+            # Check this before related-field validation so an unauthorized
+            # caller cannot enumerate category or stock-location identifiers.
+            raise PermissionDenied(_('You do not have permission to create products'))
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        approval_enabled = common.settings.get_global_setting(
+            'SCAN_APPROVAL_ENABLED', False
+        )
+        approval_request_id = serializer.validated_data.get('approval_request_id')
+        if approval_enabled and approval_request_id is None:
+            return Response(
+                {
+                    'success': False,
+                    'terminal': True,
+                    'error_code': 'APPROVAL_REQUEST_REQUIRED',
+                    'error_message': str(
+                        _('An approval request is required for direct stock scans')
+                    ),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if not approval_enabled and approval_request_id is not None:
+            return Response(
+                {
+                    'success': False,
+                    'terminal': True,
+                    'error_code': 'SCAN_APPROVAL_DISABLED',
+                    'error_message': str(_('Scan stock approval is not enabled')),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        service = ScanStockService(
+            user=request.user,
+            operation=self.operation,
+            data=serializer.validated_data,
+            context=self.get_serializer_context(),
+        )
+        try:
+            result = service.process()
+        except ScanStockPreflight as exc:
+            return Response(
+                {
+                    'success': False,
+                    'terminal': False,
+                    'error_code': exc.code,
+                    'error_message': exc.message,
+                    **exc.details,
+                },
+                status=status.HTTP_200_OK,
+            )
+        except ScanStockIdempotencyConflict as exc:
+            return Response(
+                {
+                    'success': False,
+                    'terminal': True,
+                    'error_code': exc.code,
+                    'error_message': exc.message,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        except ScanApprovalError as exc:
+            return Response(
+                {
+                    'success': False,
+                    'terminal': True,
+                    'error_code': exc.code,
+                    'error_message': exc.message,
+                    **exc.details,
+                },
+                status=(
+                    status.HTTP_409_CONFLICT
+                    if exc.conflict
+                    else status.HTTP_400_BAD_REQUEST
+                ),
+            )
+
+        output = StockSerializers.ScanStockEventSerializer(
+            result.event, context=self.get_serializer_context()
+        ).data
+        response_status = (
+            status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
+        )
+        if not result.success:
+            response_status = status.HTTP_400_BAD_REQUEST
+
+        return Response(
+            {
+                'success': result.success,
+                'terminal': True,
+                'replayed': result.replayed,
+                'part_created': result.part_created,
+                'message': (
+                    _('Scan already processed')
+                    if result.replayed
+                    else (
+                        _('Scan added to approval request')
+                        if result.event.outcome == ScanStockEvent.Outcome.PENDING
+                        else _('Stock updated')
+                    )
+                ),
+                'error_code': result.event.error_code,
+                'error_message': result.event.error_message,
+                **(result.details or {}),
+                'event': output,
+                # Compatibility alias for the retired scan-inbound response envelope.
+                'record': output,
+            },
+            status=response_status,
+        )
+
+
+class ScanInboundView(ScanStockActionView):
+    """Inbound scan endpoint and legacy route compatibility target."""
+
+    operation = ScanStockEvent.Operation.INBOUND
+
+
+class ScanOutboundView(ScanStockActionView):
+    """Outbound scan endpoint."""
+
+    operation = ScanStockEvent.Operation.OUTBOUND
+
+
+class ScanStockEventFilter(FilterSet):
+    """API filters for immutable stock scan events."""
+
+    class Meta:
+        """Filterable scan event fields."""
+
+        model = ScanStockEvent
+        fields = [
+            'operation',
+            'outcome',
+            'error_code',
+            'operator',
+            'part',
+            'stock_item',
+            'source_location',
+            'destination_location',
+            'client_event_id',
+            'barcode_hash',
+        ]
+
+    min_date = rest_filters.IsoDateTimeFilter(
+        label=_('Scanned after'), field_name='scanned_at', lookup_expr='gte'
+    )
+    max_date = rest_filters.IsoDateTimeFilter(
+        label=_('Scanned before'), field_name='scanned_at', lookup_expr='lte'
+    )
+
+
+class ScanStockEventView(DataExportViewMixin, ListAPI):
+    """Read-only, filterable and exportable scan event list."""
+
+    queryset = (
+        ScanStockEvent.objects.select_related(
+            'part', 'stock_item', 'source_location', 'destination_location', 'operator'
+        )
+        .prefetch_related('tracking_entries')
+        .all()
+    )
+    serializer_class = StockSerializers.ScanStockEventSerializer
+    pagination_class = ScanInboundPagination
+    filterset_class = ScanStockEventFilter
+    filter_backends = SEARCH_ORDER_FILTER
+    ordering = ['-scanned_at', '-pk']
+    ordering_fields = ['scanned_at', 'completed_at', 'pk']
+    search_fields = [
+        'error_code',
+        'part_name_snapshot',
+        'part_ipn_snapshot',
+        'operator_username_snapshot',
+        'operator_display_name_snapshot',
+    ]
+    role_required = 'stock'
+    rolemap = {'GET': 'view'}
+
+
+class ScanStockEventDetail(RetrieveAPI):
+    """Read-only detail endpoint for one immutable stock scan event."""
+
+    queryset = ScanStockEventView.queryset
+    serializer_class = StockSerializers.ScanStockEventSerializer
+    role_required = 'stock'
+    rolemap = {'GET': 'view'}
+
+
+class ScanStockApprovalRequestFilter(FilterSet):
+    """Filters for the caller-visible scan approval request queue."""
+
+    mine = rest_filters.BooleanFilter(method='filter_mine')
+    pending_for_me = rest_filters.BooleanFilter(method='filter_pending_for_me')
+    reviewed_by_me = rest_filters.BooleanFilter(method='filter_reviewed_by_me')
+
+    def filter_reviewed_by_me(self, queryset, name, value):
+        """Show decisions made by the current approver."""
+        return queryset.filter(decided_by=self.request.user) if value else queryset
+
+    class Meta:
+        """Filterable approval request fields."""
+
+        model = ScanStockApprovalRequest
+        fields = ['direction', 'status', 'location', 'requester', 'approval_owner']
+
+    def filter_mine(self, queryset, name, value):
+        """Limit results to requests created by the current user."""
+        if value:
+            return queryset.filter(requester=self.request.user)
+        return queryset
+
+    def filter_pending_for_me(self, queryset, name, value):
+        """Limit results to pending requests routed to the current user."""
+        if not value:
+            return queryset
+        if not self.request.user.has_perm(ApprovalRequestService.APPROVE_PERMISSION):
+            return queryset.none()
+        owner_ids = [
+            owner.pk for owner in Owner.get_owners_matching_user(self.request.user)
+        ]
+        return queryset.filter(
+            approval_owner_id__in=owner_ids,
+            status=ScanStockApprovalRequest.Status.PENDING_APPROVAL,
+        ).exclude(requester=self.request.user)
+
+
+class ScanStockApprovalRequestList(GenericAPIView):
+    """List visible requests or create a requester-owned draft."""
+
+    approval_workflow = True
+    serializer_class = StockSerializers.ScanStockApprovalRequestSerializer
+    authentication_classes = SCAN_STOCK_AUTHENTICATION_CLASSES
+    permission_classes = [
+        IsAuthenticated,
+        ScanStockApprovalRolePermission,
+        ScanStockTokenMatchesOASRequirements,
+    ]
+    pagination_class = ScanInboundPagination
+    filterset_class = ScanStockApprovalRequestFilter
+    role_required = 'stock'
+    rolemap = {'GET': 'view', 'POST': 'add'}
+    required_alternate_scopes = InvenTree.permissions.map_scope(roles=['stock'])
+
+    def get_serializer_class(self):
+        """Use the create envelope for POST and the read model otherwise."""
+        if self.request.method == 'POST':
+            return StockSerializers.ScanStockApprovalCreateSerializer
+        return StockSerializers.ScanStockApprovalRequestSerializer
+
+    def get_serializer_context(self):
+        """Return list-safe approval serializer context for metadata."""
+        return scan_approval_serializer_context(self.request, include_lines=False)
+
+    def get_queryset(self):
+        """Return requests visible to the requester, fixed owner or audit user."""
+        queryset = ScanStockApprovalRequest.objects.select_related(
+            'location', 'requester', 'approval_owner', 'decided_by', 'cancelled_by'
+        )
+        user = self.request.user
+        if not user.has_perm(ApprovalRequestService.AUDIT_PERMISSION):
+            owner_ids = []
+            if user.has_perm(ApprovalRequestService.APPROVE_PERMISSION):
+                owner_ids = [owner.pk for owner in Owner.get_owners_matching_user(user)]
+            queryset = queryset.filter(
+                Q(requester=user) | Q(approval_owner_id__in=owner_ids)
+            )
+        queryset = (
+            StockSerializers.ScanStockApprovalRequestSerializer.annotate_queryset(
+                queryset
+            )
+        )
+        return ScanStockApprovalRequestFilter(
+            self.request.query_params, queryset=queryset, request=self.request
+        ).qs.order_by('-created_at', '-pk')
+
+    @extend_schema(
+        responses=StockSerializers.ScanStockApprovalRequestSerializer(many=True)
+    )
+    def get(self, request, *args, **kwargs):
+        """Return the caller-visible approval queue."""
+        queryset = self.get_queryset()
+        page = self.paginate_queryset(queryset)
+        serializer = StockSerializers.ScanStockApprovalRequestSerializer(
+            page,
+            many=True,
+            context=scan_approval_serializer_context(request, include_lines=False),
+        )
+        return self.get_paginated_response(serializer.data)
+
+    @extend_schema(
+        request=StockSerializers.ScanStockApprovalCreateSerializer,
+        responses={201: StockSerializers.ScanStockApprovalRequestSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        """Create a new server-side draft and fixed approval route."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            approval = ApprovalRequestService.create_request(
+                user=request.user, **serializer.validated_data
+            )
+        except ScanApprovalError as exc:
+            return scan_approval_error_response(exc)
+        approval = self._annotated(approval.pk)
+        return Response(
+            StockSerializers.ScanStockApprovalRequestSerializer(
+                approval,
+                context=scan_approval_serializer_context(request, include_lines=True),
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @staticmethod
+    def _annotated(pk):
+        """Reload one request with shared response annotations."""
+        return StockSerializers.ScanStockApprovalRequestSerializer.annotate_queryset(
+            ScanStockApprovalRequest.objects.select_related(
+                'location', 'requester', 'approval_owner', 'decided_by', 'cancelled_by'
+            ).prefetch_related('lines__tracking_entries')
+        ).get(pk=pk)
+
+
+class ScanStockApprovalRequestDetail(GenericAPIView):
+    """Retrieve one caller-visible request and all physical scan lines."""
+
+    serializer_class = StockSerializers.ScanStockApprovalRequestSerializer
+    authentication_classes = SCAN_STOCK_AUTHENTICATION_CLASSES
+    approval_workflow = True
+    permission_classes = ScanStockApprovalRequestList.permission_classes
+    role_required = 'stock'
+    rolemap = {'GET': 'view'}
+    required_alternate_scopes = InvenTree.permissions.map_scope(roles=['stock'])
+
+    def get_serializer_context(self):
+        """Return detail approval serializer context for metadata."""
+        return scan_approval_serializer_context(self.request, include_lines=True)
+
+    def get(self, request, pk, *args, **kwargs):
+        """Return one request when the caller can see it."""
+        visible = ScanStockApprovalRequestList()
+        visible.request = request
+        visible.args = args
+        visible.kwargs = kwargs
+        try:
+            approval = (
+                visible.get_queryset()
+                .prefetch_related('lines__tracking_entries')
+                .get(pk=pk)
+            )
+        except ScanStockApprovalRequest.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            StockSerializers.ScanStockApprovalRequestSerializer(
+                approval,
+                context=scan_approval_serializer_context(request, include_lines=True),
+            ).data
+        )
+
+
+class ScanStockApprovalLineDetail(GenericAPIView):
+    """Logical deletion endpoint for a draft scan line."""
+
+    serializer_class = StockSerializers.ScanStockApprovalRequestSerializer
+    authentication_classes = SCAN_STOCK_AUTHENTICATION_CLASSES
+    approval_workflow = True
+    permission_classes = ScanStockApprovalRequestList.permission_classes
+    role_required = 'stock'
+    rolemap = {'DELETE': 'change'}
+    required_alternate_scopes = InvenTree.permissions.map_scope(roles=['stock'])
+    required_alternate_scopes['DELETE'] = [[get_granular_scope('change', 'stock')]]
+
+    def get_serializer_context(self):
+        """Return detail approval serializer context for metadata."""
+        return scan_approval_serializer_context(self.request, include_lines=True)
+
+    def delete(self, request, pk, event_pk, *args, **kwargs):
+        """Remove one line and immediately release its reservation."""
+        try:
+            approval = ApprovalRequestService.remove_line(
+                request_id=pk, event_id=event_pk, user=request.user
+            )
+        except ScanApprovalError as exc:
+            return scan_approval_error_response(exc)
+        approval = ScanStockApprovalRequestList._annotated(approval.pk)
+        return Response(
+            StockSerializers.ScanStockApprovalRequestSerializer(
+                approval,
+                context=scan_approval_serializer_context(request, include_lines=True),
+            ).data
+        )
+
+
+class ScanStockApprovalAction(GenericAPIView):
+    """Shared submit/cancel/approve/reject lifecycle action endpoint."""
+
+    authentication_classes = SCAN_STOCK_AUTHENTICATION_CLASSES
+    approval_workflow = True
+    permission_classes = ScanStockApprovalRequestList.permission_classes
+    serializer_class = StockSerializers.ScanStockApprovalActionSerializer
+    role_required = 'stock'
+    rolemap = {'POST': 'change'}
+    required_alternate_scopes = InvenTree.permissions.map_scope(roles=['stock'])
+    required_alternate_scopes['POST'] = [[get_granular_scope('change', 'stock')]]
+    action = None
+
+    @extend_schema(
+        request=StockSerializers.ScanStockApprovalActionSerializer,
+        responses=StockSerializers.ScanStockApprovalRequestSerializer,
+    )
+    def post(self, request, pk, *args, **kwargs):
+        """Dispatch one named lifecycle action through the domain service."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        note = serializer.validated_data.get('note', '')
+        method = getattr(ApprovalRequestService, self.action)
+        call = {'request_id': pk, 'user': request.user}
+        if self.action in {'cancel', 'approve', 'reject'}:
+            call['note'] = note
+        try:
+            approval = method(**call)
+        except ScanApprovalError as exc:
+            return scan_approval_error_response(exc)
+        approval = ScanStockApprovalRequestList._annotated(approval.pk)
+        return Response(
+            StockSerializers.ScanStockApprovalRequestSerializer(
+                approval,
+                context=scan_approval_serializer_context(request, include_lines=True),
+            ).data
+        )
+
+
+class ScanStockApprovalSubmit(ScanStockApprovalAction):
+    """Submit action."""
+
+    action = 'submit'
+
+
+class ScanStockApprovalCancel(ScanStockApprovalAction):
+    """Cancel action."""
+
+    action = 'cancel'
+    approval_service_permission = 'authenticated'
+
+
+class ScanStockApprovalApprove(ScanStockApprovalAction):
+    """Approve action."""
+
+    action = 'approve'
+    approval_service_permission = 'approve'
+
+
+class ScanStockApprovalReject(ScanStockApprovalAction):
+    """Reject action."""
+
+    action = 'reject'
+    approval_service_permission = 'approve'
+
+
+def scan_approval_error_response(exc: ScanApprovalError) -> Response:
+    """Return the stable approval error envelope used by every lifecycle endpoint."""
+    return Response(
+        {
+            'success': False,
+            'error_code': exc.code,
+            'error_message': exc.message,
+            **exc.details,
+        },
+        status=(
+            status.HTTP_409_CONFLICT if exc.conflict else status.HTTP_400_BAD_REQUEST
+        ),
+    )
+
+
+def scan_approval_serializer_context(request, *, include_lines: bool) -> dict:
+    """Precompute current owner membership once for list-safe action flags."""
+    return {
+        'request': request,
+        'include_lines': include_lines,
+        'current_owner_ids': {
+            owner.pk for owner in Owner.get_owners_matching_user(request.user)
+        },
+    }
 
 
 class StockItemContextMixin:
@@ -1120,6 +1727,100 @@ class StockList(
     filterset_class = StockFilter
     output_options = StockOutputOptions
 
+    def filter_queryset(self, queryset):
+        """Apply WMS filters after native permissions, search and table filters."""
+        queryset = super().filter_queryset(queryset)
+        if self.request.query_params.get('wms') != 'true':
+            return queryset
+        from .wms import current_stock_filter, filter_parts
+
+        params = self.request.query_params
+        queryset = filter_parts(
+            queryset.filter(current_stock_filter()), params, 'part__'
+        )
+        if params.get('contract'):
+            queryset = queryset.filter(
+                source_detail__contract__number__icontains=params['contract']
+            )
+        if params.get('detail_uid'):
+            queryset = queryset.filter(source_detail__uid=params['detail_uid'])
+        items = list(queryset)
+        frozen = StockItem.bulk_scan_frozen_quantity(items)
+        ids = []
+        for item in items:
+            occupied = frozen.get(item.pk, 0) > 0
+            positive = item.quantity > 0
+            if (
+                params.get('include_zero') != 'true'
+                and params.get('has_stock') != 'false'
+                and not (positive or occupied)
+            ):
+                continue
+            if params.get('has_stock') in ('true', 'false') and positive != (
+                params['has_stock'] == 'true'
+            ):
+                continue
+            if params.get('has_frozen') in ('true', 'false') and occupied != (
+                params['has_frozen'] == 'true'
+            ):
+                continue
+            ids.append(item.pk)
+        return queryset.filter(pk__in=ids)
+
+    def list(self, request, *args, **kwargs):
+        """Keep native rows and operations, with totals over the same full scope."""
+        if request.query_params.get('wms') != 'true':
+            return super().list(request, *args, **kwargs)
+        from collections import defaultdict
+        from decimal import Decimal
+
+        from .wms import (
+            COUNT_COLUMNS,
+            INVENTORY_COLUMNS,
+            inventory_rows,
+            list_response,
+            part_row,
+            stamp,
+        )
+
+        queryset = self.filter_queryset(self.get_queryset())
+        summary = request.query_params.get('view') == 'summary'
+        rows = inventory_rows(
+            {'include_zero': 'true', 'view': 'summary' if summary else 'detail'},
+            queryset,
+        )
+        units = defaultdict(Decimal)
+        for row in rows:
+            units[row['units']] += Decimal(row['quantity'])
+        statistics = {
+            'part_count': len({row['pk'] for row in rows}),
+            'units': dict(units),
+        }
+        if summary or request.query_params.get('export') == 'csv':
+            columns = dict(INVENTORY_COLUMNS)
+            for label in (
+                ('项目', '地点完整路径', '最后库存变动时间', '库存备注')
+                if summary
+                else ('项目数量',)
+            ):
+                columns.pop(label)
+            if not summary:
+                columns = COUNT_COLUMNS
+            return list_response(request, rows, columns, 'inventory', statistics)
+        page = self.paginate_queryset(queryset)
+        items = page if page is not None else list(queryset)
+        data = self.get_serializer(items, many=True).data
+        for item, record in zip(items, data, strict=True):
+            record['wms_equipment'] = part_row(item.part)
+            record['inventory_changed_at'] = stamp(item.inventory_changed_at)
+        response = (
+            self.get_paginated_response(data)
+            if page is not None
+            else Response({'count': len(data), 'results': data})
+        )
+        response.data['statistics'] = statistics
+        return response
+
     def create(self, request, *args, **kwargs):
         """Create a new StockItem object via the API.
 
@@ -1173,20 +1874,22 @@ class StockList(
             try:
                 supplier_part = SupplierPart.objects.get(pk=supplier_part_id)
             except Exception:
-                raise ValidationError({
-                    'supplier_part': _('The given supplier part does not exist')
-                })
+                raise ValidationError(
+                    {'supplier_part': _('The given supplier part does not exist')}
+                )
 
             if supplier_part.base_quantity() != 1:
                 # Skip this check if pack size is 1 - makes no difference
                 # use_pack_size = True -> Multiply quantity by pack size
                 # use_pack_size = False -> Use quantity as is
                 if 'use_pack_size' not in data:
-                    raise ValidationError({
-                        'use_pack_size': _(
-                            'The supplier part has a pack size defined, but flag use_pack_size not set'
-                        )
-                    })
+                    raise ValidationError(
+                        {
+                            'use_pack_size': _(
+                                'The supplier part has a pack size defined, but flag use_pack_size not set'
+                            )
+                        }
+                    )
                 elif bool(data.get('use_pack_size')):
                     quantity = data['quantity'] = supplier_part.base_quantity(quantity)
 
@@ -1214,11 +1917,15 @@ class StockList(
         # Assign serial numbers for a trackable part
         if serial_numbers:
             if not part.trackable:
-                raise ValidationError({
-                    'serial_numbers': [
-                        _('Serial numbers cannot be supplied for a non-trackable part')
-                    ]
-                })
+                raise ValidationError(
+                    {
+                        'serial_numbers': [
+                            _(
+                                'Serial numbers cannot be supplied for a non-trackable part'
+                            )
+                        ]
+                    }
+                )
 
             # If serial numbers are specified, check that they match!
             try:
@@ -1247,10 +1954,9 @@ class StockList(
                     raise ValidationError({'serial_numbers': errors})
 
             except DjangoValidationError as e:
-                raise ValidationError({
-                    'quantity': e.messages,
-                    'serial_numbers': e.messages,
-                })
+                raise ValidationError(
+                    {'quantity': e.messages, 'serial_numbers': e.messages}
+                )
 
         if serials is not None:
             """If the stock item is going to be serialized, set the quantity to 1."""
@@ -1356,6 +2062,11 @@ class StockList(
     ordering = ['part__name', 'quantity', 'location']
 
     search_fields = [
+        'part__brand',
+        'part__model_number',
+        'part__specification',
+        'part__notes',
+        'notes',
         'serial',
         'batch',
         'location__name',
@@ -1490,11 +2201,13 @@ class StockItemTestResultFilter(FilterSet):
             item = StockItem.objects.get(pk=value)
 
         except StockItem.DoesNotExist:
-            raise ValidationError({
-                'stock_item': _('Stock item with ID {id} does not exist').format(
-                    id=value
-                )
-            })
+            raise ValidationError(
+                {
+                    'stock_item': _('Stock item with ID {id} does not exist').format(
+                        id=value
+                    )
+                }
+            )
 
         items = [item]
 
@@ -1551,6 +2264,7 @@ class StockTrackingOutputOptions(OutputConfiguration):
 
     OPTIONS = [
         InvenTreeOutputOption(flag='item_detail'),
+        InvenTreeOutputOption(flag='part_detail'),
         InvenTreeOutputOption(flag='user_detail'),
     ]
 
@@ -1562,7 +2276,7 @@ class StockTrackingFilter(FilterSet):
         """Metaclass options."""
 
         model = StockItemTracking
-        fields = ['item', 'user']
+        fields = ['item', 'user', 'scan_event']
 
     include_variants = rest_filters.BooleanFilter(
         label=_('Include Part Variants'), method='filter_include_variants'
@@ -1628,6 +2342,7 @@ class StockTrackingList(
         return {
             'part': (Part, PartBriefSerializer),
             'location': (StockLocation, StockSerializers.LocationSerializer),
+            'old_location': (StockLocation, StockSerializers.LocationSerializer),
             'customer': (Company, CompanySerializer),
             'purchaseorder': (PurchaseOrder, PurchaseOrderSerializer),
             'salesorder': (SalesOrder, SalesOrderSerializer),
@@ -1694,39 +2409,97 @@ class StockTrackingList(
     search_fields = ['notes']
 
 
+from stock.contract_api import (
+    WmsChangeHistory,
+    WmsContracts,
+    WmsDetailChange,
+    WmsLabelResolve,
+    WmsLegacyAttribute,
+    WmsProjects,
+    WmsReceiptCancel,
+    WmsReceiptChange,
+    WmsReceipts,
+)
+
+from .wms import WmsImports, WmsInventory, WmsOptions, WmsParts, WmsRecords
+
 stock_api_urls = [
     path(
+        'wms/receipts/<int:pk>/',
+        WmsReceiptChange.as_view(),
+        name='api-wms-receipt-change',
+    ),
+    path('wms/contracts/', WmsContracts.as_view(), name='api-wms-contracts'),
+    path('wms/projects/', WmsProjects.as_view(), name='api-wms-projects'),
+    path('wms/receipts/', WmsReceipts.as_view(), name='api-wms-receipts'),
+    path(
+        'wms/receipts/<int:pk>/cancel/',
+        WmsReceiptCancel.as_view(),
+        name='api-wms-receipt-cancel',
+    ),
+    path(
+        'wms/details/<int:pk>/', WmsDetailChange.as_view(), name='api-wms-detail-change'
+    ),
+    path(
+        'wms/labels/resolve/', WmsLabelResolve.as_view(), name='api-wms-label-resolve'
+    ),
+    path(
+        'wms/legacy/<int:pk>/',
+        WmsLegacyAttribute.as_view(),
+        name='api-wms-legacy-attribute',
+    ),
+    path('wms/changes/', WmsChangeHistory.as_view(), name='api-wms-changes'),
+    path('wms/inventory/', WmsInventory.as_view(), name='api-wms-inventory'),
+    path('wms/records/', WmsRecords.as_view(), name='api-wms-records'),
+    path('wms/parts/', WmsParts.as_view(), name='api-wms-parts'),
+    path('wms/options/', WmsOptions.as_view(), name='api-wms-options'),
+    path('wms/imports/', WmsImports.as_view(), name='api-wms-imports'),
+    path(
         'location/',
-        include([
-            path('tree/', StockLocationTree.as_view(), name='api-location-tree'),
-            # Stock location detail endpoints
-            path(
-                '<int:pk>/',
-                include([
-                    meta_path(StockLocation),
-                    path('', StockLocationDetail.as_view(), name='api-location-detail'),
-                ]),
-            ),
-            path('', StockLocationList.as_view(), name='api-location-list'),
-        ]),
+        include(
+            [
+                path('tree/', StockLocationTree.as_view(), name='api-location-tree'),
+                # Stock location detail endpoints
+                path(
+                    '<int:pk>/',
+                    include(
+                        [
+                            meta_path(StockLocation),
+                            path(
+                                '',
+                                StockLocationDetail.as_view(),
+                                name='api-location-detail',
+                            ),
+                        ]
+                    ),
+                ),
+                path('', StockLocationList.as_view(), name='api-location-list'),
+            ]
+        ),
     ),
     # Stock location type endpoints
     path(
         'location-type/',
-        include([
-            path(
-                '<int:pk>/',
-                include([
-                    meta_path(StockLocationType),
-                    path(
-                        '',
-                        StockLocationTypeDetail.as_view(),
-                        name='api-location-type-detail',
+        include(
+            [
+                path(
+                    '<int:pk>/',
+                    include(
+                        [
+                            meta_path(StockLocationType),
+                            path(
+                                '',
+                                StockLocationTypeDetail.as_view(),
+                                name='api-location-type-detail',
+                            ),
+                        ]
                     ),
-                ]),
-            ),
-            path('', StockLocationTypeList.as_view(), name='api-location-type-list'),
-        ]),
+                ),
+                path(
+                    '', StockLocationTypeList.as_view(), name='api-location-type-list'
+                ),
+            ]
+        ),
     ),
     # Endpoints for bulk stock adjustment actions
     path('count/', StockCount.as_view(), name='api-stock-count'),
@@ -1737,74 +2510,136 @@ stock_api_urls = [
     path('assign/', StockAssign.as_view(), name='api-stock-assign'),
     path('merge/', StockMerge.as_view(), name='api-stock-merge'),
     path('change_status/', StockChangeStatus.as_view(), name='api-stock-change-status'),
+    path('scan/inbound/', ScanInboundView.as_view(), name='api-stock-scan-inbound-v2'),
+    path('scan/outbound/', ScanOutboundView.as_view(), name='api-stock-scan-outbound'),
+    path('scan/events/', ScanStockEventView.as_view(), name='api-stock-scan-events'),
+    path(
+        'scan/events/<int:pk>/',
+        ScanStockEventDetail.as_view(),
+        name='api-stock-scan-event-detail',
+    ),
+    path(
+        'scan/requests/',
+        ScanStockApprovalRequestList.as_view(),
+        name='api-stock-scan-request-list',
+    ),
+    path(
+        'scan/requests/<int:pk>/',
+        ScanStockApprovalRequestDetail.as_view(),
+        name='api-stock-scan-request-detail',
+    ),
+    path(
+        'scan/requests/<int:pk>/lines/<int:event_pk>/',
+        ScanStockApprovalLineDetail.as_view(),
+        name='api-stock-scan-request-line-detail',
+    ),
+    path(
+        'scan/requests/<int:pk>/submit/',
+        ScanStockApprovalSubmit.as_view(),
+        name='api-stock-scan-request-submit',
+    ),
+    path(
+        'scan/requests/<int:pk>/cancel/',
+        ScanStockApprovalCancel.as_view(),
+        name='api-stock-scan-request-cancel',
+    ),
+    path(
+        'scan/requests/<int:pk>/approve/',
+        ScanStockApprovalApprove.as_view(),
+        name='api-stock-scan-request-approve',
+    ),
+    path(
+        'scan/requests/<int:pk>/reject/',
+        ScanStockApprovalReject.as_view(),
+        name='api-stock-scan-request-reject',
+    ),
+    path('scan-inbound/', ScanInboundView.as_view(), name='api-stock-scan-inbound'),
     # StockItemTestResult API endpoints
     path(
         'test/',
-        include([
-            path(
-                '<int:pk>/',
-                include([
-                    meta_path(StockItemTestResult),
-                    path(
-                        '',
-                        StockItemTestResultDetail.as_view(),
-                        name='api-stock-test-result-detail',
+        include(
+            [
+                path(
+                    '<int:pk>/',
+                    include(
+                        [
+                            meta_path(StockItemTestResult),
+                            path(
+                                '',
+                                StockItemTestResultDetail.as_view(),
+                                name='api-stock-test-result-detail',
+                            ),
+                        ]
                     ),
-                ]),
-            ),
-            path(
-                '', StockItemTestResultList.as_view(), name='api-stock-test-result-list'
-            ),
-        ]),
+                ),
+                path(
+                    '',
+                    StockItemTestResultList.as_view(),
+                    name='api-stock-test-result-list',
+                ),
+            ]
+        ),
     ),
     # StockItemTracking API endpoints
     path(
         'track/',
-        include([
-            path(
-                '<int:pk>/',
-                StockTrackingDetail.as_view(),
-                name='api-stock-tracking-detail',
-            ),
-            # Stock tracking status code information
-            path(
-                'status/',
-                StatusView.as_view(),
-                {StatusView.MODEL_REF: StockHistoryCode},
-                name='api-stock-tracking-status-codes',
-            ),
-            path('', StockTrackingList.as_view(), name='api-stock-tracking-list'),
-        ]),
+        include(
+            [
+                path(
+                    '<int:pk>/',
+                    StockTrackingDetail.as_view(),
+                    name='api-stock-tracking-detail',
+                ),
+                # Stock tracking status code information
+                path(
+                    'status/',
+                    StatusView.as_view(),
+                    {StatusView.MODEL_REF: StockHistoryCode},
+                    name='api-stock-tracking-status-codes',
+                ),
+                path('', StockTrackingList.as_view(), name='api-stock-tracking-list'),
+            ]
+        ),
     ),
     # Detail views for a single stock item
     path(
         '<int:pk>/',
-        include([
-            path('convert/', StockItemConvert.as_view(), name='api-stock-item-convert'),
-            path(
-                'disassemble/',
-                StockItemDisassemble.as_view(),
-                name='api-stock-item-disassemble',
-            ),
-            path('install/', StockItemInstall.as_view(), name='api-stock-item-install'),
-            meta_path(StockItem),
-            path(
-                'serialize/',
-                StockItemSerialize.as_view(),
-                name='api-stock-item-serialize',
-            ),
-            path(
-                'uninstall/',
-                StockItemUninstall.as_view(),
-                name='api-stock-item-uninstall',
-            ),
-            path(
-                'serial-numbers/',
-                StockItemSerialNumbers.as_view(),
-                name='api-stock-item-serial-numbers',
-            ),
-            path('', StockDetail.as_view(), name='api-stock-detail'),
-        ]),
+        include(
+            [
+                path(
+                    'convert/',
+                    StockItemConvert.as_view(),
+                    name='api-stock-item-convert',
+                ),
+                path(
+                    'disassemble/',
+                    StockItemDisassemble.as_view(),
+                    name='api-stock-item-disassemble',
+                ),
+                path(
+                    'install/',
+                    StockItemInstall.as_view(),
+                    name='api-stock-item-install',
+                ),
+                meta_path(StockItem),
+                path(
+                    'serialize/',
+                    StockItemSerialize.as_view(),
+                    name='api-stock-item-serialize',
+                ),
+                path(
+                    'uninstall/',
+                    StockItemUninstall.as_view(),
+                    name='api-stock-item-uninstall',
+                ),
+                path(
+                    'serial-numbers/',
+                    StockItemSerialNumbers.as_view(),
+                    name='api-stock-item-serial-numbers',
+                ),
+                path('', StockDetail.as_view(), name='api-stock-detail'),
+            ]
+        ),
     ),
     # Stock item status code information
     path(

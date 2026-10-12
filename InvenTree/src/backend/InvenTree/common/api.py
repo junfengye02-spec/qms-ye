@@ -1274,7 +1274,8 @@ class DataOutputViewSet(BulkDeleteViewsetMixin, RetrieveDestroyModelViewSet):
 
     def get_queryset(self):
         """Return the set of DataOutput objects which the user has permission to view."""
-        queryset = super().get_queryset()
+        # Local print outputs use task-bound permissions, including for staff.
+        queryset = super().get_queryset().filter(localprintjob__isnull=True)
 
         try:
             user = self.request.user

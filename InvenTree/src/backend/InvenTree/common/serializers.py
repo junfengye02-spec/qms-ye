@@ -136,11 +136,13 @@ class SettingsSerializer(InvenTreeModelSerializer):
         if self.instance.confirm():
             req_data = self.context['request'].data
             if not 'manual_confirm' in req_data or not req_data['manual_confirm']:
-                raise serializers.ValidationError({
-                    'manual_confirm': _(
-                        'This setting requires confirmation before changing. Please confirm the change.'
-                    )
-                })
+                raise serializers.ValidationError(
+                    {
+                        'manual_confirm': _(
+                            'This setting requires confirmation before changing. Please confirm the change.'
+                        )
+                    }
+                )
         return ret
 
 
@@ -415,6 +417,18 @@ class NotesImageSerializer(InvenTreeModelSerializer):
 class ProjectCodeSerializer(DataImportExportSerializerMixin, InvenTreeModelSerializer):
     """Serializer for the ProjectCode model."""
 
+    def validate_code(self, value):
+        """Normalize before checking archive uniqueness, including surrounding spaces."""
+        value = value.strip()
+        matches = common_models.ProjectCode.objects.filter(code=value)
+        if self.instance:
+            matches = matches.exclude(pk=self.instance.pk)
+        if not value or matches.exists():
+            raise serializers.ValidationError(
+                _('Project code is required and must be unique')
+            )
+        return value
+
     class Meta:
         """Meta options for ProjectCodeSerializer."""
 
@@ -595,14 +609,16 @@ class TaskDetailSerializer(serializers.Serializer):
 
         if task_id is None or type(task_id) is bool:
             # If the task_id is a boolean, the task has been run synchronously
-            return cls({
-                'task_id': '',
-                'exists': False,
-                'pending': False,
-                'complete': task_id is not None,
-                'success': False if task_id is None else bool(task_id),
-                'http_status': 404 if task_id is None else 200,
-            })
+            return cls(
+                {
+                    'task_id': '',
+                    'exists': False,
+                    'pending': False,
+                    'complete': task_id is not None,
+                    'success': False if task_id is None else bool(task_id),
+                    'http_status': 404 if task_id is None else 200,
+                }
+            )
 
         # A non-boolean result indicates that the task has been offloaded to the background worker
         success = django_q.models.Success.objects.filter(id=task_id).first()
@@ -627,14 +643,16 @@ class TaskDetailSerializer(serializers.Serializer):
         # - 404: Task does not exist
         http_status = 200 if exists or queued else 404
 
-        return cls({
-            'task_id': task_id,
-            'exists': exists or queued,
-            'pending': queued,
-            'complete': complete,
-            'success': bool(success),
-            'http_status': http_status,
-        })
+        return cls(
+            {
+                'task_id': task_id,
+                'exists': exists or queued,
+                'pending': queued,
+                'complete': complete,
+                'success': bool(success),
+                'http_status': http_status,
+            }
+        )
 
 
 class TaskOverviewSerializer(serializers.Serializer):

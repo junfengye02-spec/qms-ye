@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextvars
 import os
+import uuid
 from contextlib import contextmanager
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
@@ -54,9 +55,15 @@ from part import models as PartModels
 from plugin.events import trigger_event
 from stock.events import StockEvents
 from stock.generators import generate_batch_code
-from users.models import Owner
+from users.models import Owner, operator_snapshot
 
 logger = structlog.get_logger('inventree')
+
+
+def generate_scan_approval_reference() -> str:
+    """Return a collision-resistant external reference for a scan request."""
+    date = InvenTree.helpers.current_date().strftime('%Y%m%d')
+    return f'SA-{date}-{uuid.uuid4().hex[:12].upper()}'
 
 
 class StockLocationType(InvenTree.models.MetadataMixin, models.Model):
@@ -201,6 +208,16 @@ class StockLocation(
         related_name='stock_locations',
     )
 
+    approval_owner = models.ForeignKey(
+        Owner,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        verbose_name=_('Scan Approval Owner'),
+        help_text=_('User or group responsible for approving scan stock requests'),
+        related_name='scan_approval_locations',
+    )
+
     structural = models.BooleanField(
         default=False,
         verbose_name=_('Structural'),
@@ -264,6 +281,14 @@ class StockLocation(
         for loc in self.get_ancestors(include_self=True, ascending=True):
             if loc.owner is not None:
                 return loc.owner
+
+        return None
+
+    def get_scan_approval_owner(self):
+        """Return the closest configured scan approval owner in the location tree."""
+        for location in self.get_ancestors(include_self=True, ascending=True):
+            if location.approval_owner is not None:
+                return location.approval_owner
 
         return None
 
@@ -483,7 +508,12 @@ class StockItem(
                 # "no serial" is not a value this constraint should govern
                 condition=Q(serial__isnull=False) & ~Q(serial=''),
                 name='stock_item_unique_part_serial',
-            )
+            ),
+            UniqueConstraint(
+                fields=['part', 'location'],
+                condition=Q(is_scan_inbound_item=True),
+                name='stock_item_unique_scan_inbound_part_location',
+            ),
         ]
 
     class MPTTMeta:
@@ -491,6 +521,7 @@ class StockItem(
 
         order_insertion_by = ['part']
 
+    @transaction.atomic
     def save(self, *args, **kwargs):
         """Save this StockItem to the database.
 
@@ -501,6 +532,16 @@ class StockItem(
         self.validate_unique()
         self.clean()
         self.update_serial_number()
+
+        # Native stock writes also join the same project archive when a project is supplied.
+        if self.batch:
+            from common.models import ProjectCode
+
+            self.project_code, _ = ProjectCode.objects.get_or_create(code=self.batch)
+        else:
+            self.project_code = None
+        if kwargs.get('update_fields') is not None:
+            kwargs['update_fields'] = set(kwargs['update_fields']) | {'project_code'}
 
         user = kwargs.pop('user', None)
 
@@ -519,7 +560,39 @@ class StockItem(
             # (we wish to record these as historical records)
 
             try:
-                old = StockItem.objects.get(pk=self.pk)
+                old = StockItem.objects.select_for_update().get(pk=self.pk)
+
+                if any(
+                    getattr(old, field) != getattr(self, field)
+                    for field in ('quantity', 'part_id', 'location_id', 'batch')
+                ):
+                    self.inventory_changed_at = InvenTree.helpers.current_time()
+                    if kwargs.get('update_fields') is not None:
+                        kwargs['update_fields'] = set(kwargs['update_fields']) | {
+                            'inventory_changed_at'
+                        }
+
+                semantic_fields = (
+                    'part_id',
+                    'location_id',
+                    'batch',
+                    'status',
+                    'packaging',
+                    'supplier_part_id',
+                    'expiry_date',
+                    'serial',
+                )
+                if any(
+                    getattr(old, field) != getattr(self, field)
+                    for field in semantic_fields
+                ):
+                    old.ensure_scan_structure_mutable()
+                if self.quantity < old.quantity:
+                    old.ensure_scan_freeze_invariant(
+                        self.quantity,
+                        allocation_credit=getattr(self, '_allocation_credit', 0),
+                    )
+
                 old_custom_status = old.get_custom_status()
                 custom_status = self.get_custom_status()
 
@@ -566,6 +639,7 @@ class StockItem(
                 quantity=float(self.quantity),
             )
 
+    @transaction.atomic
     def delete(self, ignore_serial_check: bool = False, **kwargs):
         """Custom delete method for StockItem model.
 
@@ -575,20 +649,25 @@ class StockItem(
         Arguments:
             ignore_serial_check: If True, allow deletion of serialized stock items regardless of global setting
         """
+        try:
+            locked = StockItem.objects.select_for_update().get(pk=self.pk)
+        except StockItem.DoesNotExist:
+            return
+        locked.ensure_scan_structure_mutable()
+
         if not ignore_serial_check and not get_global_setting(
             'STOCK_ALLOW_DELETE_SERIALIZED', cache=False
         ):
-            if self.serialized:
+            if locked.serialized:
                 raise ValidationError(_('Serialized stock items cannot be deleted'))
 
-        with transaction.atomic():
-            # Re-link any child items to the parent of this item,
-            # so the genealogy chain survives deletion of an intermediate item
+        # Re-link any child items to the parent of this item,
+        # so the genealogy chain survives deletion of an intermediate item
 
-            parent = StockItem.objects.filter(pk=self.parent_id).first()
-            StockItem.objects.filter(parent=self).update(parent=parent)
+        parent = StockItem.objects.filter(pk=locked.parent_id).first()
+        StockItem.objects.filter(parent=locked).update(parent=parent)
 
-            super().delete(**kwargs)
+        super().delete(**kwargs)
 
     @staticmethod
     def get_api_url():
@@ -714,8 +793,7 @@ class StockItem(
             # 'part' itself), so concurrent creation attempts for any part in
             # the same tree serialize against each other
             list(
-                PartModels.Part.objects
-                .select_for_update()
+                PartModels.Part.objects.select_for_update()
                 .filter(tree_id=part.tree_id)
                 .order_by('pk')
             )
@@ -1018,12 +1096,21 @@ class StockItem(
         - The location is not structural
         - Quantity must be 1 if the StockItem has a serial number
         """
-        if self.location is not None and self.location.structural:
-            raise ValidationError({
-                'location': _(
-                    'Stock items cannot be located into structural stock locations!'
+        if self.source_detail_id:
+            detail = WmsReceiptDetail.objects.get(pk=self.source_detail_id)
+            if self.part_id != detail.part_id or self.batch != detail.project:
+                raise ValidationError(
+                    _('Update receipt attribution through the WMS detail workflow')
                 )
-            })
+
+        if self.location is not None and self.location.structural:
+            raise ValidationError(
+                {
+                    'location': _(
+                        'Stock items cannot be located into structural stock locations!'
+                    )
+                }
+            )
 
         super().clean()
 
@@ -1041,18 +1128,19 @@ class StockItem(
             # which fetches and diffs *every* field, dereferencing every non-null FK in the
             # process) since only the previous 'serial' value is actually needed.
             old_serial = (
-                StockItem.objects
-                .filter(pk=self.pk)
+                StockItem.objects.filter(pk=self.pk)
                 .values_list('serial', flat=True)
                 .first()
             )
 
             if old_serial not in [None, ''] and old_serial != self.serial:
-                raise ValidationError({
-                    'serial': _(
-                        'Editing of serial numbers is not allowed - this item has already been assigned a serial number'
-                    )
-                })
+                raise ValidationError(
+                    {
+                        'serial': _(
+                            'Editing of serial numbers is not allowed - this item has already been assigned a serial number'
+                        )
+                    }
+                )
 
         # Custom validation of batch code
         self.validate_batch_code()
@@ -1060,15 +1148,19 @@ class StockItem(
         try:
             # Trackable parts must have integer values for quantity field!
             if self.part.trackable and self.quantity != int(self.quantity):
-                raise ValidationError({
-                    'quantity': _('Quantity must be integer value for trackable parts')
-                })
+                raise ValidationError(
+                    {
+                        'quantity': _(
+                            'Quantity must be integer value for trackable parts'
+                        )
+                    }
+                )
 
             # Virtual parts cannot have stock items created against them
             if self.part.virtual:
-                raise ValidationError({
-                    'part': _('Stock item cannot be created for virtual parts')
-                })
+                raise ValidationError(
+                    {'part': _('Stock item cannot be created for virtual parts')}
+                )
         except PartModels.Part.DoesNotExist:
             # For some reason the 'clean' process sometimes throws errors because self.part does not exist
             # It *seems* that this only occurs in unit testing, though.
@@ -1082,34 +1174,40 @@ class StockItem(
         try:
             if self.supplier_part is not None:
                 if self.supplier_part.part != self.part:
-                    raise ValidationError({
-                        'supplier_part': _(
-                            f"Part type ('{self.supplier_part.part}') must be {self.part}"
-                        )
-                    })
+                    raise ValidationError(
+                        {
+                            'supplier_part': _(
+                                f"Part type ('{self.supplier_part.part}') must be {self.part}"
+                            )
+                        }
+                    )
 
             if self.part is not None:
                 # A part with a serial number MUST have the quantity set to 1
                 if self.serial:
                     if self.quantity > 1:
-                        raise ValidationError({
-                            'quantity': _(
-                                'Quantity must be 1 for item with a serial number'
-                            ),
-                            'serial': _(
-                                'Serial number cannot be set if quantity greater than 1'
-                            ),
-                        })
+                        raise ValidationError(
+                            {
+                                'quantity': _(
+                                    'Quantity must be 1 for item with a serial number'
+                                ),
+                                'serial': _(
+                                    'Serial number cannot be set if quantity greater than 1'
+                                ),
+                            }
+                        )
 
                     if self.quantity == 0:
                         self.quantity = 1
 
                     elif self.quantity > 1:
-                        raise ValidationError({
-                            'quantity': _(
-                                'Quantity must be 1 for item with a serial number'
-                            )
-                        })
+                        raise ValidationError(
+                            {
+                                'quantity': _(
+                                    'Quantity must be 1 for item with a serial number'
+                                )
+                            }
+                        )
 
                     # Serial numbered items cannot be deleted on depletion
                     self.delete_on_deplete = False
@@ -1123,9 +1221,9 @@ class StockItem(
 
         # If the item is marked as "is_building", it must point to a build!
         if self.is_building and not self.build:
-            raise ValidationError({
-                'build': _('Item must have a build reference if is_building=True')
-            })
+            raise ValidationError(
+                {'build': _('Item must have a build reference if is_building=True')}
+            )
 
         # If the item points to a build, check that the Part references match
         if self.build:
@@ -1136,9 +1234,13 @@ class StockItem(
                 # Part reference is one of the valid conversion options for the build output
                 pass
             else:
-                raise ValidationError({
-                    'build': _('Build reference does not point to the same part object')
-                })
+                raise ValidationError(
+                    {
+                        'build': _(
+                            'Build reference does not point to the same part object'
+                        )
+                    }
+                )
 
     def get_absolute_url(self):
         """Return url for instance."""
@@ -1235,6 +1337,25 @@ class StockItem(
         max_length=2000,
     )
 
+    inventory_changed_at = models.DateTimeField(default=InvenTree.helpers.current_time)
+
+    source_detail = models.ForeignKey(
+        'stock.WmsReceiptDetail',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='stock_items',
+        editable=False,
+    )
+
+    project_code = models.ForeignKey(
+        'common.ProjectCode',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='wms_stock_items',
+    )
+
     batch = models.CharField(
         verbose_name=_('Batch Code'),
         max_length=100,
@@ -1250,6 +1371,15 @@ class StockItem(
         decimal_places=5,
         validators=[MinValueValidator(0)],
         default=1,
+    )
+
+    is_scan_inbound_item = models.BooleanField(
+        default=False,
+        editable=False,
+        verbose_name=_('Scan Inbound Stock Item'),
+        help_text=_(
+            'Marks the dedicated stock item used to accumulate scan inbound quantity'
+        ),
     )
 
     build = models.ForeignKey(
@@ -1584,14 +1714,14 @@ class StockItem(
         if quantity is not None and not self.serialized:
             # If quantity is specified, we are splitting the stock item
             if quantity <= 0:
-                raise ValidationError({
-                    'quantity': _('Quantity must be greater than zero')
-                })
+                raise ValidationError(
+                    {'quantity': _('Quantity must be greater than zero')}
+                )
 
             if quantity > self.quantity:
-                raise ValidationError({
-                    'quantity': _('Quantity exceeds available stock')
-                })
+                raise ValidationError(
+                    {'quantity': _('Quantity exceeds available stock')}
+                )
 
             if quantity < self.quantity:
                 # Split the stock item
@@ -1766,8 +1896,91 @@ class StockItem(
         return bo + so + to
 
     def unallocated_quantity(self):
-        """Return the quantity of this StockItem which is *not* allocated."""
-        return max(self.quantity - self.allocation_count(), 0)
+        """Return quantity not allocated by native flows or active scan requests."""
+        return max(
+            self.quantity - self.allocation_count() - self.scan_frozen_quantity(), 0
+        )
+
+    def active_scan_freezes(self):
+        """Return active outbound scan events currently freezing this stock item."""
+        return self.scan_stock_events.filter(
+            operation=ScanStockEvent.Operation.OUTBOUND,
+            outcome=ScanStockEvent.Outcome.PENDING,
+            approval_request__status__in=ScanStockApprovalRequest.active_statuses(),
+        )
+
+    def scan_frozen_quantity(self) -> Decimal:
+        """Return the quantity frozen by active outbound scan requests."""
+        if not self.pk:
+            return Decimal(0)
+
+        value = self.active_scan_freezes().aggregate(
+            quantity=Coalesce(Sum('requested_quantity'), Decimal(0))
+        )['quantity']
+        return value or Decimal(0)
+
+    def active_scan_approval_references(self) -> list[str]:
+        """Return stable references for requests currently freezing this item."""
+        return list(
+            self.active_scan_freezes()
+            .order_by('approval_request__reference')
+            .values_list('approval_request__reference', flat=True)
+            .distinct()
+        )
+
+    def ensure_scan_freeze_invariant(
+        self, quantity=None, *, allocation_credit=Decimal(0)
+    ) -> None:
+        """Enforce physical >= remaining native allocation + active scan freeze.
+
+        ``allocation_credit`` is reserved for a native fulfillment path which is
+        consuming and releasing that exact allocation inside the same transaction.
+        It never discounts scan freezes.
+        """
+        if not self.pk:
+            return
+
+        quantity = self.quantity if quantity is None else Decimal(quantity)
+        frozen = self.scan_frozen_quantity()
+        allocated = max(self.allocation_count() - Decimal(allocation_credit), 0)
+        required = allocated + frozen
+        if quantity < required:
+            references = ', '.join(self.active_scan_approval_references())
+            raise ValidationError(
+                {
+                    'quantity': _(
+                        'Quantity must remain at least %(required)s for native allocations and active scan requests (%(references)s)'
+                    )
+                    % {'required': required, 'references': references or '-'}
+                }
+            )
+
+    def ensure_scan_structure_mutable(self) -> None:
+        """Reject structural stock mutations while an active scan freeze exists."""
+        references = self.active_scan_approval_references()
+        if references:
+            raise ValidationError(
+                _(
+                    'Stock item is reserved by active scan approval request(s): %(references)s'
+                )
+                % {'references': ', '.join(references)}
+            )
+
+    @staticmethod
+    def bulk_scan_frozen_quantity(stock_items) -> dict[int, Decimal]:
+        """Bulk-compute active scan-frozen quantities for stock item instances."""
+        pks = [item.pk for item in stock_items if item.pk]
+        return {
+            row['stock_item']: row['quantity']
+            for row in ScanStockEvent.objects.filter(
+                stock_item__in=pks,
+                operation=ScanStockEvent.Operation.OUTBOUND,
+                outcome=ScanStockEvent.Outcome.PENDING,
+                approval_request__status__in=ScanStockApprovalRequest.active_statuses(),
+            )
+            .values('stock_item')
+            .annotate(quantity=Coalesce(Sum('requested_quantity'), Decimal(0)))
+        }
 
     @staticmethod
     def bulk_allocation_count(stock_items) -> dict:
@@ -1962,9 +2175,9 @@ class StockItem(
             return False
 
         if location and location.structural:
-            raise ValidationError({
-                'location': _('Cannot assign stock to structural location')
-            })
+            raise ValidationError(
+                {'location': _('Cannot assign stock to structural location')}
+            )
 
         # Add a transaction note to the parent item
         self.belongs_to.add_tracking_entry(
@@ -2121,16 +2334,18 @@ class StockItem(
             raise ValidationError(_('Stock item no longer exists'))
 
         if quantity > self.quantity:
-            raise ValidationError({
-                'quantity': _('Quantity must not exceed available stock quantity')
-            })
+            raise ValidationError(
+                {'quantity': _('Quantity must not exceed available stock quantity')}
+            )
 
         if self.serialized and quantity != self.quantity:
-            raise ValidationError({
-                'quantity': _(
-                    'Serialized stock item must be disassembled in its entirety'
-                )
-            })
+            raise ValidationError(
+                {
+                    'quantity': _(
+                        'Serialized stock item must be disassembled in its entirety'
+                    )
+                }
+            )
 
         if len(lines) == 0:
             raise ValidationError(_('No BOM lines provided'))
@@ -2140,11 +2355,13 @@ class StockItem(
         installed_items = list(self.installed_parts.all())
 
         if len(installed_items) > 0 and quantity != self.quantity:
-            raise ValidationError({
-                'quantity': _(
-                    'Stock item with installed items must be disassembled in its entirety'
-                )
-            })
+            raise ValidationError(
+                {
+                    'quantity': _(
+                        'Stock item with installed items must be disassembled in its entirety'
+                    )
+                }
+            )
 
         # Cache the custom status options for the StockItem model
         custom_status_values = StockItem.STATUS_CLASS.custom_values()
@@ -2294,12 +2511,14 @@ class StockItem(
         if check_in_production and self.is_building:
             return False
 
-        return all([
-            self.sales_order is None,  # Not assigned to a SalesOrder
-            self.belongs_to is None,  # Not installed inside another StockItem
-            self.customer is None,  # Not assigned to a customer
-            self.consumed_by is None,  # Not consumed by a build
-        ])
+        return all(
+            [
+                self.sales_order is None,  # Not assigned to a SalesOrder
+                self.belongs_to is None,  # Not installed inside another StockItem
+                self.customer is None,  # Not assigned to a customer
+                self.consumed_by is None,  # Not consumed by a build
+            ]
+        )
 
     @property
     def in_stock(self) -> bool:
@@ -2367,6 +2586,8 @@ class StockItem(
         ):
             return None
 
+        scan_event = kwargs.pop('scan_event', None)
+
         # Extract any additional information from the kwargs
         self._apply_model_reference_fields(kwargs, deltas)
 
@@ -2387,6 +2608,8 @@ class StockItem(
             date=InvenTree.helpers.current_time(),
             notes=notes,
             deltas=deltas,
+            scan_event=scan_event,
+            **operator_snapshot(user),
         )
 
         if commit:
@@ -2444,21 +2667,23 @@ class StockItem(
             raise ValidationError(_('Stock item no longer exists'))
 
         if quantity > self.quantity:
-            raise ValidationError({
-                'quantity': _(
-                    f'Quantity must not exceed available stock quantity ({self.quantity})'
-                )
-            })
+            raise ValidationError(
+                {
+                    'quantity': _(
+                        f'Quantity must not exceed available stock quantity ({self.quantity})'
+                    )
+                }
+            )
 
         if type(serials) not in [list, tuple]:
-            raise ValidationError({
-                'serial_numbers': _('Serial numbers must be provided as a list')
-            })
+            raise ValidationError(
+                {'serial_numbers': _('Serial numbers must be provided as a list')}
+            )
 
         if quantity != len(serials):
-            raise ValidationError({
-                'quantity': _('Quantity does not match serial numbers')
-            })
+            raise ValidationError(
+                {'quantity': _('Quantity does not match serial numbers')}
+            )
 
         # Test if each of the serial numbers are valid
         existing = self.part.find_conflicting_serial_numbers(serials)
@@ -2474,9 +2699,9 @@ class StockItem(
 
         if location:
             if location.structural:
-                raise ValidationError({
-                    'location': _('Cannot assign stock to structural location')
-                })
+                raise ValidationError(
+                    {'location': _('Cannot assign stock to structural location')}
+                )
 
             data['location_id'] = location.pk
 
@@ -2602,9 +2827,9 @@ class StockItem(
                         part=self.part, test_name=test_name
                     )
                 else:
-                    raise ValidationError({
-                        'template': _('Test template does not exist')
-                    })
+                    raise ValidationError(
+                        {'template': _('Test template does not exist')}
+                    )
 
         kwargs['template'] = template
         kwargs['stock_item'] = self
@@ -2619,6 +2844,11 @@ class StockItem(
 
         try:
             # Generic checks (do not rely on the 'other' part)
+            self.ensure_scan_structure_mutable()
+
+            if self.is_scan_inbound_item:
+                raise ValidationError(_('Scan inbound stock items cannot be merged'))
+
             if self.sales_order:
                 raise ValidationError(
                     _('Stock item has been assigned to a sales order')
@@ -2645,6 +2875,13 @@ class StockItem(
                 # Prevent stock item being merged with itself
                 if self == other:
                     raise ValidationError(_('Duplicate stock items'))
+
+                if self.source_detail_id != other.source_detail_id or (
+                    self.source_detail_id and self.batch != other.batch
+                ):
+                    raise ValidationError(
+                        _('Stock from different receipt details cannot be merged')
+                    )
 
                 # Base part must match
                 if self.part != other.part:
@@ -2682,8 +2919,7 @@ class StockItem(
             return None
 
         candidates = list(
-            StockItem.objects
-            .filter(part=self.part, location=location)
+            StockItem.objects.filter(part=self.part, location=location)
             .exclude(pk=self.pk)
             .order_by('pk')
         )
@@ -2721,13 +2957,17 @@ class StockItem(
         if len(other_items) == 0:
             return
 
+        if self.is_scan_inbound_item or any(
+            item.is_scan_inbound_item for item in other_items
+        ):
+            raise ValidationError(_('Scan inbound stock items cannot be merged'))
+
         # Lock all database rows (in pk order, to avoid deadlocks between
         # concurrent merges) and refresh the quantity of each item
         items_to_merge = sorted([self, *other_items], key=lambda item: item.pk)
 
         locked_quantities = dict(
-            StockItem.objects
-            .select_for_update()
+            StockItem.objects.select_for_update()
             .filter(pk__in=[item.pk for item in items_to_merge])
             .values_list('pk', 'quantity')
         )
@@ -2874,6 +3114,9 @@ class StockItem(
         - The provided quantity will be subtracted from this item and given to the new one.
         - The new item will have a different StockItem ID, while this will remain the same.
         """
+        if self.is_scan_inbound_item:
+            raise ValidationError(_('Scan inbound stock items cannot be split'))
+
         # Do not split a serialized part
         if self.serialized:
             return None
@@ -2904,6 +3147,8 @@ class StockItem(
         # Lock the database row, so concurrent adjustments are serialized
         if not self.lock_quantity():
             return None
+
+        self.ensure_scan_structure_mutable()
 
         # Also doesn't make sense to split the full amount
         if quantity >= self.quantity:
@@ -3071,11 +3316,16 @@ class StockItem(
             status: If provided, override the status (default = existing status)
             packaging: If provided, override the packaging (default = existing packaging)
         """
+        if self.is_scan_inbound_item:
+            raise ValidationError(_('Scan inbound stock items cannot be transferred'))
+
         current_location = self.location
 
         # Lock the database row, so concurrent adjustments are serialized
         if not self.lock_quantity():
             return False
+
+        self.ensure_scan_structure_mutable()
 
         try:
             quantity = Decimal(kwargs.pop('quantity', self.quantity))
@@ -3123,6 +3373,9 @@ class StockItem(
             tracking_code = StockHistoryCode.STOCK_UPDATE
         else:
             tracking_info['location'] = location.pk
+            tracking_info['old_location'] = (
+                current_location.pk if current_location else None
+            )
 
         status = self._resolve_status_kwarg(kwargs)
         self._apply_status_change(status, tracking_info)
@@ -3163,8 +3416,7 @@ class StockItem(
             return False
 
         quantity = (
-            StockItem.objects
-            .select_for_update()
+            StockItem.objects.select_for_update()
             .filter(pk=self.pk)
             .values_list('quantity', flat=True)
             .first()
@@ -3242,6 +3494,8 @@ class StockItem(
         # Lock the database row, so concurrent adjustments are serialized
         if not self.lock_quantity():
             return False
+
+        self.ensure_scan_freeze_invariant(count)
 
         tracking_info = {}
 
@@ -3326,6 +3580,8 @@ class StockItem(
             notes: Optional notes for the stock addition
             status: Optionally adjust the stock status
         """
+        scan_event = kwargs.pop('scan_event', None)
+
         # Cannot add items to a serialized part
         if self.serialized:
             return False
@@ -3372,6 +3628,7 @@ class StockItem(
                 user,
                 notes=kwargs.get('notes', ''),
                 deltas=tracking_info,
+                scan_event=scan_event,
             )
 
         return True
@@ -3391,6 +3648,7 @@ class StockItem(
             record_tracking: If False, skip creating a tracking entry
         """
         record_tracking = kwargs.pop('record_tracking', True)
+        scan_event = kwargs.pop('scan_event', None)
 
         # Cannot remove items from a serialized part
         if self.serialized:
@@ -3412,6 +3670,17 @@ class StockItem(
         if not self.lock_quantity():
             return False
 
+        # Approval application first moves its request to APPLYING in the same
+        # transaction, so its own reservation is no longer counted here while
+        # reservations belonging to every other active request remain protected.
+        allocation_credit = Decimal(kwargs.pop('allocation_credit', 0))
+        try:
+            self.ensure_scan_freeze_invariant(
+                self.quantity - quantity, allocation_credit=allocation_credit
+            )
+        except ValidationError:
+            return False
+
         deltas = {}
 
         status = self._resolve_status_kwarg(kwargs)
@@ -3426,7 +3695,11 @@ class StockItem(
             field in kwargs for field in StockItem.optional_transfer_fields()
         )
 
-        quantity_updated = self.updateQuantity(self.quantity - quantity)
+        self._allocation_credit = allocation_credit
+        try:
+            quantity_updated = self.updateQuantity(self.quantity - quantity)
+        finally:
+            del self._allocation_credit
 
         # Record the resulting quantity, whether or not this item survived the removal
         # (self.quantity is updated by updateQuantity() even if the item was deleted)
@@ -3445,7 +3718,11 @@ class StockItem(
         # StockItemTracking.item uses SET_NULL so the history is retained regardless.
         if record_tracking:
             self.add_tracking_entry(
-                code, user, notes=kwargs.get('notes', ''), deltas=deltas
+                code,
+                user,
+                notes=kwargs.get('notes', ''),
+                deltas=deltas,
+                scan_event=scan_event,
             )
 
         return True
@@ -3783,7 +4060,679 @@ class StockItemTracking(InvenTree.models.InvenTreeModel):
 
     user = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True)
 
+    operator_user_id_snapshot = models.IntegerField(blank=True, null=True)
+
+    operator_username_snapshot = models.CharField(max_length=150, blank=True)
+
+    operator_display_name_snapshot = models.CharField(max_length=255, blank=True)
+
+    scan_event = models.ForeignKey(
+        'stock.ScanStockEvent',
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='tracking_entries',
+    )
+
     deltas = models.JSONField(null=True, blank=True)
+
+
+class ScanInboundBarcodeLock(InvenTree.models.InvenTreeModel):
+    """Stable per-barcode lock used while registering unknown scan barcodes."""
+
+    class Meta:
+        """Model options for scan inbound barcode locks."""
+
+        verbose_name = _('Scan Inbound Barcode Lock')
+        verbose_name_plural = _('Scan Inbound Barcode Locks')
+
+    barcode_hash = models.CharField(
+        max_length=128, unique=True, editable=False, verbose_name=_('Barcode Hash')
+    )
+
+
+class WmsContract(InvenTree.models.InvenTreeModel):
+    """Contract defaults are inherited independently by receipt detail fields."""
+
+    number = models.CharField(max_length=100, unique=True)
+    acceptance_date = models.DateField(null=True, blank=True)
+    warranty_months = models.PositiveIntegerField(
+        default=12, validators=[MinValueValidator(1)]
+    )
+    created_by = models.ForeignKey(
+        User, null=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    updated_by = models.ForeignKey(
+        User, null=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Keep month validation at the database boundary too."""
+
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(warranty_months__gt=0), name='wms_contract_months_positive'
+            )
+        ]
+
+    def clean(self):
+        """Normalize the readable contract number without changing its case."""
+        super().clean()
+        self.number = self.number.strip()
+        if not self.number:
+            raise ValidationError({'number': _('Contract number is required')})
+
+
+class WmsReceipt(InvenTree.models.InvenTreeModel):
+    """Lightweight preparation inside the existing inbound workflow."""
+
+    request_key = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    input_snapshot = models.JSONField(default=dict, blank=True)
+    project = models.CharField(max_length=100)
+    project_code = models.ForeignKey(
+        'common.ProjectCode',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='wms_receipts',
+    )
+    contract = models.ForeignKey(
+        WmsContract, on_delete=models.PROTECT, related_name='receipts'
+    )
+    location = models.ForeignKey(
+        StockLocation, on_delete=models.PROTECT, related_name='wms_receipts'
+    )
+    operator = models.ForeignKey(
+        User, null=True, on_delete=models.SET_NULL, related_name='wms_receipts'
+    )
+    cancelled = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class WmsReceiptDetail(
+    report.mixins.InvenTreeReportMixin, InvenTree.models.InvenTreeModel
+):
+    """One immutable identity per prepared equipment line, shared by all its units."""
+
+    receipt = models.ForeignKey(
+        WmsReceipt, on_delete=models.PROTECT, related_name='details'
+    )
+    part = models.ForeignKey(
+        'part.Part', on_delete=models.PROTECT, related_name='wms_receipt_details'
+    )
+    project = models.CharField(max_length=100)
+    project_code = models.ForeignKey(
+        'common.ProjectCode',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='wms_details',
+    )
+    contract = models.ForeignKey(
+        WmsContract, on_delete=models.PROTECT, related_name='details'
+    )
+    prepared_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        validators=[MinValueValidator(Decimal('0.00001'))],
+    )
+    acceptance_date_override = models.DateField(null=True, blank=True)
+    warranty_months_override = models.PositiveIntegerField(
+        null=True, blank=True, validators=[MinValueValidator(1)]
+    )
+    uid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    label_version = models.PositiveIntegerField(default=1, editable=False)
+    legacy = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Preserve valid quantities and independent nullable warranty overrides."""
+
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(prepared_quantity__gt=0),
+                name='wms_detail_quantity_positive',
+            ),
+            models.CheckConstraint(
+                condition=Q(warranty_months_override__isnull=True)
+                | Q(warranty_months_override__gt=0),
+                name='wms_detail_months_positive',
+            ),
+        ]
+
+    @property
+    def effective_acceptance_date(self):
+        """Acceptance is the contract start date for every associated item."""
+        return self.contract.acceptance_date
+
+    @property
+    def effective_warranty_months(self):
+        """Use the single warranty term maintained on the contract."""
+        return self.contract.warranty_months
+
+    @property
+    def complete_barcode(self):
+        """Provide print context without requiring a formal inventory row."""
+        from stock.warranty import encode_label
+
+        return encode_label(self)
+
+    def report_context(self) -> dict:
+        """Supply native label context for receipt detail printing."""
+        return {
+            'detail': self,
+            'part': self.part,
+            'complete_barcode': self.complete_barcode,
+        }
+
+
+class WmsBusinessChange(InvenTree.models.InvenTreeModel):
+    """Append-only before/after audit for preparation, attribution and printing."""
+
+    contract = models.ForeignKey(
+        WmsContract, null=True, on_delete=models.PROTECT, related_name='changes'
+    )
+    receipt = models.ForeignKey(
+        WmsReceipt, null=True, on_delete=models.PROTECT, related_name='changes'
+    )
+    detail = models.ForeignKey(
+        WmsReceiptDetail, null=True, on_delete=models.PROTECT, related_name='changes'
+    )
+    actor = models.ForeignKey(
+        User, null=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    action = models.CharField(max_length=32)
+    reason = models.CharField(max_length=2000, blank=True)
+    before = models.JSONField(default=dict)
+    after = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class ScanStockApprovalRequest(InvenTree.models.InvenTreeModel):
+    """A server-side scan stock draft which is applied as one atomic request."""
+
+    class Direction(models.TextChoices):
+        """Supported approval directions."""
+
+        INBOUND = 'INBOUND', _('Inbound')
+        OUTBOUND = 'OUTBOUND', _('Outbound')
+
+    class Status(models.TextChoices):
+        """Approval lifecycle states."""
+
+        DRAFT = 'DRAFT', _('Draft')
+        PENDING_APPROVAL = 'PENDING_APPROVAL', _('Pending approval')
+        APPLYING = 'APPLYING', _('Applying')
+        COMPLETED = 'COMPLETED', _('Completed')
+        REJECTED = 'REJECTED', _('Rejected')
+        CANCELLED = 'CANCELLED', _('Cancelled')
+        EXPIRED = 'EXPIRED', _('Expired')
+
+    class Meta:
+        """Model options for scan stock approval requests."""
+
+        verbose_name = _('Scan Stock Approval Request')
+        verbose_name_plural = _('Scan Stock Approval Requests')
+        ordering = ['-created_at', '-pk']
+        permissions = [
+            ('approve_scanstockapprovalrequest', 'Can approve scan stock requests'),
+            ('audit_scanstockapprovalrequest', 'Can audit all scan stock requests'),
+        ]
+        indexes = [
+            models.Index(fields=['status', 'expires_at'], name='scan_req_expiry_idx'),
+            models.Index(
+                fields=['approval_owner', 'status', 'submitted_at'],
+                name='scan_req_approver_idx',
+            ),
+            models.Index(
+                fields=['requester', '-created_at'], name='scan_req_requester_idx'
+            ),
+            models.Index(fields=['location', 'status'], name='scan_req_location_idx'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(direction__in=['INBOUND', 'OUTBOUND']),
+                name='scan_req_direction_valid',
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    status__in=[
+                        'DRAFT',
+                        'PENDING_APPROVAL',
+                        'APPLYING',
+                        'COMPLETED',
+                        'REJECTED',
+                        'CANCELLED',
+                        'EXPIRED',
+                    ]
+                ),
+                name='scan_req_status_valid',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(
+                        status__in=[
+                            'PENDING_APPROVAL',
+                            'APPLYING',
+                            'COMPLETED',
+                            'REJECTED',
+                        ]
+                    )
+                    | Q(submitted_at__isnull=False)
+                ),
+                name='scan_req_submitted_time',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status__in=['COMPLETED', 'REJECTED'])
+                    | (Q(decided_by__isnull=False) & Q(decided_at__isnull=False))
+                ),
+                name='scan_req_decision_audit',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status='CANCELLED')
+                    | (Q(cancelled_by__isnull=False) & Q(cancelled_at__isnull=False))
+                ),
+                name='scan_req_cancel_audit',
+            ),
+        ]
+
+    @classmethod
+    def active_statuses(cls) -> tuple[str, str]:
+        """Return statuses whose outbound lines reserve inventory."""
+        return (cls.Status.DRAFT, cls.Status.PENDING_APPROVAL)
+
+    @classmethod
+    def terminal_statuses(cls) -> tuple[str, ...]:
+        """Return terminal lifecycle states."""
+        return (
+            cls.Status.COMPLETED,
+            cls.Status.REJECTED,
+            cls.Status.CANCELLED,
+            cls.Status.EXPIRED,
+        )
+
+    def get_absolute_url(self):
+        """Return the frontend detail URL for this approval request."""
+        return InvenTree.helpers.pui_url(f'/stock/scan/requests/{self.pk}')
+
+    reference = models.CharField(
+        max_length=32, unique=True, default=generate_scan_approval_reference
+    )
+    direction = models.CharField(max_length=8, choices=Direction.choices)
+    status = models.CharField(
+        max_length=24, choices=Status.choices, default=Status.DRAFT
+    )
+    location = models.ForeignKey(
+        StockLocation, on_delete=models.PROTECT, related_name='scan_approval_requests'
+    )
+    location_path_snapshot = models.CharField(max_length=1000, blank=True)
+    requester = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='scan_stock_approval_requests',
+    )
+    requester_user_id_snapshot = models.IntegerField(blank=True, null=True)
+    requester_username_snapshot = models.CharField(max_length=150, blank=True)
+    requester_display_name_snapshot = models.CharField(max_length=255, blank=True)
+    approval_owner = models.ForeignKey(
+        Owner,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='scan_stock_approval_requests',
+    )
+    approval_owner_snapshot = models.JSONField(default=dict, blank=True)
+    submitted_at = models.DateTimeField(blank=True, null=True)
+    activity_at = models.DateTimeField(default=InvenTree.helpers.current_time)
+    expires_at = models.DateTimeField()
+    decided_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='decided_scan_stock_approval_requests',
+    )
+    decided_at = models.DateTimeField(blank=True, null=True)
+    decision_note = models.TextField(blank=True)
+    cancelled_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='cancelled_scan_stock_approval_requests',
+    )
+    cancelled_at = models.DateTimeField(blank=True, null=True)
+    cancel_note = models.TextField(blank=True)
+    last_approval_error = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(default=InvenTree.helpers.current_time)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ScanStockEvent(InvenTree.models.InvenTreeModel):
+    """Immutable business audit for one inbound or outbound scan attempt."""
+
+    class Operation(models.TextChoices):
+        """Supported stock scan directions."""
+
+        INBOUND = 'INBOUND', _('Inbound')
+        OUTBOUND = 'OUTBOUND', _('Outbound')
+
+    class Outcome(models.TextChoices):
+        """Terminal and in-progress outcomes."""
+
+        PENDING = 'PENDING', _('Pending')
+        SUCCESS = 'SUCCESS', _('Success')
+        FAILED = 'FAILED', _('Failed')
+
+    class BarcodeKind(models.TextChoices):
+        """Business object represented by the scanned barcode."""
+
+        PART = 'PART', _('Part')
+        STOCK_ITEM = 'STOCK_ITEM', _('Stock item')
+        LOCATION = 'LOCATION', _('Stock location')
+        EXTERNAL = 'EXTERNAL', _('External barcode')
+        RECEIPT_DETAIL = 'RECEIPT_DETAIL', _('Complete receipt label')
+
+    class ActorKind(models.TextChoices):
+        """Origin of the operation."""
+
+        USER = 'USER', _('User')
+        SYSTEM = 'SYSTEM', _('System')
+        API = 'API', _('API')
+
+    class Meta:
+        """Model options for scan stock events."""
+
+        verbose_name = _('Scan Stock Event')
+        verbose_name_plural = _('Scan Stock Events')
+        ordering = ['-scanned_at', '-pk']
+        indexes = [
+            models.Index(fields=['-scanned_at', '-id'], name='scan_stock_recent_idx'),
+            models.Index(
+                fields=['operation', '-scanned_at'], name='scan_stock_operation_idx'
+            ),
+            models.Index(
+                fields=['outcome', '-scanned_at'], name='scan_stock_outcome_idx'
+            ),
+            models.Index(fields=['part', '-scanned_at'], name='scan_stock_part_idx'),
+            models.Index(
+                fields=['operator', '-scanned_at'], name='scan_stock_operator_idx'
+            ),
+            models.Index(
+                fields=['barcode_hash', '-scanned_at'], name='scan_stock_barcode_idx'
+            ),
+            models.Index(
+                fields=['approval_request', 'request_line_number'],
+                name='scan_stock_request_idx',
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['source_detail'],
+                condition=Q(
+                    source_detail__isnull=False,
+                    operation='INBOUND',
+                    outcome__in=['PENDING', 'SUCCESS'],
+                ),
+                name='wms_detail_one_inbound',
+            ),
+            models.CheckConstraint(
+                condition=Q(operation__in=['INBOUND', 'OUTBOUND']),
+                name='scan_stock_operation_valid',
+            ),
+            models.CheckConstraint(
+                condition=Q(outcome__in=['PENDING', 'SUCCESS', 'FAILED']),
+                name='scan_stock_outcome_valid',
+            ),
+            models.CheckConstraint(
+                condition=Q(requested_quantity__gt=0),
+                name='scan_stock_requested_quantity_positive',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        outcome='SUCCESS',
+                        applied_quantity=models.F('requested_quantity'),
+                    )
+                    | Q(outcome__in=['PENDING', 'FAILED'], applied_quantity=0)
+                ),
+                name='scan_stock_applied_quantity_matches_outcome',
+            ),
+            models.CheckConstraint(
+                condition=~Q(outcome='SUCCESS') | Q(completed_at__isnull=False),
+                name='scan_stock_success_completed',
+            ),
+            models.UniqueConstraint(
+                fields=['approval_request', 'request_line_number'],
+                condition=Q(approval_request__isnull=False),
+                name='scan_stock_request_line_unique',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(approval_request__isnull=True, request_line_number__isnull=True)
+                    | Q(approval_request__isnull=False, request_line_number__gt=0)
+                ),
+                name='scan_stock_request_line_pair',
+            ),
+        ]
+
+    source_detail = models.ForeignKey(
+        WmsReceiptDetail,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='events',
+    )
+    detail_uid_snapshot = models.UUIDField(null=True, blank=True)
+    label_version_snapshot = models.PositiveIntegerField(null=True, blank=True)
+    contract_number_snapshot = models.CharField(max_length=100, blank=True)
+    acceptance_date_snapshot = models.DateField(null=True, blank=True)
+    warranty_months_snapshot = models.PositiveIntegerField(null=True, blank=True)
+    warranty_end_snapshot = models.DateField(null=True, blank=True)
+
+    units_snapshot = models.CharField(max_length=20, blank=True)
+    purpose = models.CharField(max_length=250, blank=True)
+    remark = models.TextField(blank=True)
+    approver_snapshot = models.CharField(max_length=255, blank=True)
+
+    client_event_id = models.UUIDField(unique=True, editable=False)
+    request_fingerprint = models.CharField(max_length=64, editable=False)
+    fingerprint_version = models.CharField(max_length=20, default='v1', editable=False)
+    operation = models.CharField(max_length=8, choices=Operation.choices)
+    outcome = models.CharField(
+        max_length=8, choices=Outcome.choices, default=Outcome.PENDING
+    )
+    error_code = models.CharField(max_length=64, blank=True)
+    error_message = models.CharField(max_length=500, blank=True)
+    barcode = models.CharField(max_length=2000)
+    barcode_hash = models.CharField(max_length=128, editable=False)
+    barcode_kind = models.CharField(
+        max_length=16, choices=BarcodeKind.choices, default=BarcodeKind.EXTERNAL
+    )
+    requested_quantity = models.DecimalField(max_digits=15, decimal_places=5)
+    applied_quantity = models.DecimalField(
+        max_digits=15, decimal_places=5, default=Decimal(0)
+    )
+
+    approval_request = models.ForeignKey(
+        ScanStockApprovalRequest,
+        on_delete=models.PROTECT,
+        blank=True,
+        null=True,
+        related_name='lines',
+    )
+    request_line_number = models.PositiveIntegerField(blank=True, null=True)
+    requested_part_setup = models.JSONField(default=dict, blank=True)
+    requested_stock_context = models.JSONField(default=dict, blank=True)
+    terminal_reason = models.CharField(max_length=64, blank=True)
+
+    part = models.ForeignKey(
+        'part.Part',
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='scan_stock_events',
+    )
+    part_pk_snapshot = models.IntegerField(blank=True, null=True)
+    part_name_snapshot = models.CharField(max_length=100, blank=True)
+    part_ipn_snapshot = models.CharField(max_length=100, blank=True)
+    stock_item = models.ForeignKey(
+        StockItem,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='scan_stock_events',
+    )
+    stock_item_pk_snapshot = models.IntegerField(blank=True, null=True)
+    batch_snapshot = models.CharField(max_length=100, blank=True)
+    source_location = models.ForeignKey(
+        StockLocation,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='outbound_scan_stock_events',
+    )
+    destination_location = models.ForeignKey(
+        StockLocation,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='inbound_scan_stock_events',
+    )
+    source_location_path_snapshot = models.CharField(max_length=1000, blank=True)
+    destination_location_path_snapshot = models.CharField(max_length=1000, blank=True)
+    stock_item_quantity_before = models.DecimalField(
+        max_digits=15, decimal_places=5, blank=True, null=True
+    )
+    stock_item_quantity_after = models.DecimalField(
+        max_digits=15, decimal_places=5, blank=True, null=True
+    )
+    part_total_before = models.DecimalField(
+        max_digits=15, decimal_places=5, blank=True, null=True
+    )
+    part_total_after = models.DecimalField(
+        max_digits=15, decimal_places=5, blank=True, null=True
+    )
+
+    operator = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='scan_stock_events',
+    )
+    operator_user_id_snapshot = models.IntegerField(blank=True, null=True)
+    operator_username_snapshot = models.CharField(max_length=150, blank=True)
+    operator_display_name_snapshot = models.CharField(max_length=255, blank=True)
+    actor_kind = models.CharField(
+        max_length=8, choices=ActorKind.choices, default=ActorKind.USER
+    )
+    device_id = models.CharField(max_length=255, blank=True)
+    session_id = models.CharField(max_length=255, blank=True)
+    replay_count = models.PositiveIntegerField(default=0)
+    last_replayed_at = models.DateTimeField(blank=True, null=True)
+    scanned_at = models.DateTimeField(default=InvenTree.helpers.current_time)
+    completed_at = models.DateTimeField(blank=True, null=True)
+    legacy_inbound_record_pk = models.IntegerField(unique=True, blank=True, null=True)
+
+
+class ScanInboundRecord(InvenTree.models.InvenTreeModel):
+    """Immutable audit record for a single scan inbound operation.
+
+    Each successful barcode scan creates exactly one record in the same database
+    transaction as the stock adjustment. Snapshot quantities make the result of
+    every scan auditable even after later stock movements.
+    """
+
+    class Meta:
+        """Model options for scan inbound records."""
+
+        verbose_name = _('Scan Inbound Record')
+        verbose_name_plural = _('Scan Inbound Records')
+        ordering = ['-scanned_at', '-pk']
+        indexes = [
+            models.Index(fields=['-scanned_at', '-id'], name='scan_inbound_recent_idx')
+        ]
+
+    barcode = models.CharField(
+        max_length=500,
+        verbose_name=_('Barcode'),
+        help_text=_('Raw numeric barcode received from the scanner'),
+    )
+
+    client_event_id = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
+        unique=True,
+        verbose_name=_('Client Event ID'),
+        help_text=_(
+            'Unique client-generated identifier used to make scan retries idempotent'
+        ),
+    )
+
+    part = models.ForeignKey(
+        'part.Part',
+        on_delete=models.PROTECT,
+        related_name='scan_inbound_records',
+        verbose_name=_('Part'),
+    )
+
+    location = models.ForeignKey(
+        StockLocation,
+        on_delete=models.PROTECT,
+        related_name='scan_inbound_records',
+        verbose_name=_('Stock Location'),
+    )
+
+    stock_item = models.ForeignKey(
+        StockItem,
+        on_delete=models.PROTECT,
+        related_name='scan_inbound_records',
+        verbose_name=_('Stock Item'),
+    )
+
+    quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        default=Decimal(1),
+        validators=[MinValueValidator(1)],
+        verbose_name=_('Inbound Quantity'),
+    )
+
+    stock_item_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        verbose_name=_('Stock Item Quantity'),
+        help_text=_('Dedicated scan stock item quantity after this scan'),
+    )
+
+    new_total_stock = models.DecimalField(
+        max_digits=15,
+        decimal_places=5,
+        verbose_name=_('New Total Stock'),
+        help_text=_('Part total stock after this scan'),
+    )
+
+    scanned_at = models.DateTimeField(
+        auto_now_add=True, editable=False, verbose_name=_('Scanned At')
+    )
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='scan_inbound_records',
+        verbose_name=_('User'),
+    )
 
 
 def rename_stock_item_test_result_attachment(instance, filename):
@@ -3854,9 +4803,9 @@ class StockItemTestResult(InvenTree.models.InvenTreeMetadataModel):
             raise ValidationError({'value': _('Value must be provided for this test')})
 
         if template.requires_attachment and not self.attachment:
-            raise ValidationError({
-                'attachment': _('Attachment must be uploaded for this test')
-            })
+            raise ValidationError(
+                {'attachment': _('Attachment must be uploaded for this test')}
+            )
 
         if choices := template.get_choices():
             if self.value not in choices:
@@ -3932,3 +4881,15 @@ class StockItemTestResult(InvenTree.models.InvenTreeMetadataModel):
     date = models.DateTimeField(
         default=InvenTree.helpers.current_time, verbose_name=_('Date')
     )
+
+
+class WmsImportTask(InvenTree.models.InvenTreeModel):
+    """Persist an owned preview and its atomic, idempotent import result."""
+
+    kind = models.CharField(max_length=20)
+    operator = models.ForeignKey(User, on_delete=models.PROTECT)
+    rows = models.JSONField(default=list)
+    preview = models.JSONField(default=list)
+    result = models.JSONField(default=list)
+    created_at = models.DateTimeField(default=InvenTree.helpers.current_time)
+    completed_at = models.DateTimeField(null=True, blank=True)

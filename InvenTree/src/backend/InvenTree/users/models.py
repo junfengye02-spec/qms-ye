@@ -46,6 +46,42 @@ User.add_to_class('__str__', user_model_str)  # Overriding User.__str__
 #  OVERRIDE END
 
 
+def get_user_display_name(user) -> str:
+    """Return the canonical display name used for immutable audit snapshots."""
+    if user is None:
+        return ''
+
+    try:
+        if display_name := (user.profile.displayname or '').strip():
+            return display_name
+    except (AttributeError, UserProfile.DoesNotExist):
+        pass
+
+    display_name = str(user).strip()
+
+    if display_name:
+        return display_name
+
+    full_name = user.get_full_name().strip()
+    return full_name or user.get_username()
+
+
+def operator_snapshot(user) -> dict:
+    """Return stable identity fields for stock and scan audit records."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return {
+            'operator_user_id_snapshot': None,
+            'operator_username_snapshot': '',
+            'operator_display_name_snapshot': '',
+        }
+
+    return {
+        'operator_user_id_snapshot': user.pk,
+        'operator_username_snapshot': user.get_username(),
+        'operator_display_name_snapshot': get_user_display_name(user),
+    }
+
+
 if settings.LDAP_AUTH:
     from django_auth_ldap.backend import populate_user  # ty: ignore[unresolved-import]
 

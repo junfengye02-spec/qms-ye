@@ -1,5 +1,6 @@
 """API endpoints for barcode plugins."""
 
+from django.db import models, transaction
 from django.db.models import F
 from django.urls import include, path
 from django.utils.translation import gettext_lazy as _
@@ -15,13 +16,14 @@ from rest_framework.response import Response
 import common.models
 import InvenTree.permissions
 import order.models
+import part.models
 import plugin.base.barcodes.helper
 import stock.models
 from common.settings import get_global_setting
 from InvenTree.api import BulkDeleteMixin
 from InvenTree.exceptions import log_error
 from InvenTree.filters import SEARCH_ORDER_FILTER
-from InvenTree.helpers import hash_barcode
+from InvenTree.helpers import hash_barcode, hash_part_ipn
 from InvenTree.mixins import ListAPI, RetrieveDestroyAPI
 from plugin import PluginMixinEnum, registry
 from users.permissions import check_user_permission
@@ -274,11 +276,26 @@ class BarcodeAssign(BarcodeView):
 
     serializer_class = barcode_serializers.BarcodeAssignSerializer
 
+    @transaction.atomic
     def handle_barcode(self, barcode: str, request, **kwargs):
         """Respond to a barcode assign request.
 
         Checks inputs and assign barcode (hash) to StockItem.
         """
+        barcode_hash = hash_barcode(barcode)
+        canonical_ipn_hash = hash_barcode(f'ipn:{barcode.casefold()}')
+        lock_hashes = sorted({barcode_hash, canonical_ipn_hash})
+
+        for lock_hash in lock_hashes:
+            stock.models.ScanInboundBarcodeLock.objects.get_or_create(
+                barcode_hash=lock_hash
+            )
+
+        for lock_hash in lock_hashes:
+            stock.models.ScanInboundBarcodeLock.objects.select_for_update().get(
+                barcode_hash=lock_hash
+            )
+
         # Here we only check against 'InvenTree' plugins
         inventree_barcode_plugin = registry.get_plugin('inventreebarcode')
 
@@ -295,7 +312,11 @@ class BarcodeAssign(BarcodeView):
 
                 raise ValidationError(result)
 
-        barcode_hash = hash_barcode(barcode)
+        if part.models.Part.objects.filter(
+            models.Q(ipn_hash=hash_part_ipn(barcode))
+            | models.Q(IPN__iexact=barcode)
+        ).exists():
+            raise ValidationError({'error': _('Barcode matches an existing Part IPN')})
 
         valid_labels = []
 

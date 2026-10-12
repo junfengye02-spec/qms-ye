@@ -1594,6 +1594,22 @@ class SalesOrderAllocationSerializer(
         source='item.location', many=False, read_only=True
     )
 
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        """Revalidate allocation expansion while holding the stock row lock."""
+        item = validated_data.get('item', instance.item)
+        try:
+            instance.item = stock.models.StockItem.objects.select_for_update().get(
+                pk=item.pk
+            )
+        except stock.models.StockItem.DoesNotExist as exc:
+            raise ValidationError({'item': _('Stock item no longer exists')}) from exc
+
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        return super().update(instance, validated_data)
+
     # Extra detail fields
     order_detail = OptionalField(
         serializer_class=SalesOrderSerializer,
@@ -2898,6 +2914,22 @@ class TransferOrderAllocationSerializer(
     location = serializers.PrimaryKeyRelatedField(
         source='item.location', many=False, read_only=True
     )
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        """Revalidate allocation expansion while holding the stock row lock."""
+        item = validated_data.get('item', instance.item)
+        try:
+            instance.item = stock.models.StockItem.objects.select_for_update().get(
+                pk=item.pk
+            )
+        except stock.models.StockItem.DoesNotExist as exc:
+            raise ValidationError({'item': _('Stock item no longer exists')}) from exc
+
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        return super().update(instance, validated_data)
 
     # Extra detail fields
     order_detail = OptionalField(

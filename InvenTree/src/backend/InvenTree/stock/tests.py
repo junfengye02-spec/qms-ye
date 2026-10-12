@@ -2,6 +2,7 @@
 
 import datetime
 import threading
+import uuid
 from unittest import mock
 
 from django.contrib.auth import get_user_model
@@ -26,6 +27,7 @@ from stock.events import StockEvents
 from stock.status_codes import StockHistoryCode, StockStatus
 
 from .models import (
+    ScanStockEvent,
     StockItem,
     StockItemTestResult,
     StockItemTracking,
@@ -1971,6 +1973,288 @@ class AdminTest(AdminTestCase):
     def test_admin(self):
         """Test the admin URL."""
         self.helper(model=StockLocationType)
+
+
+@skipUnlessDBFeature('has_select_for_update')
+class ScanInboundConcurrencyTest(TransactionTestCase):
+    """Verify concurrent scans cannot lose quantity or duplicate ordinary stock."""
+
+    fixtures = ['users']
+
+    def setUp(self):
+        """Create committed scan test data for worker database connections."""
+        super().setUp()
+        self.user = get_user_model().objects.get(username='sue_the_superuser')
+        self.location = StockLocation.objects.create(name='Scan concurrency shelf')
+        self.part = Part.objects.create(
+            name='Scan concurrency part',
+            description='Part for concurrent scan inbound requests',
+            IPN='SCAN-CONCURRENCY-001',
+            default_location=self.location,
+        )
+
+    def test_concurrent_scans_do_not_lose_stock(self):
+        """Concurrent scans produce one stock item, full quantity, and all records."""
+        n_threads = 5
+        start_barrier = threading.Barrier(n_threads, timeout=10)
+        results = []
+        errors = []
+        results_lock = threading.Lock()
+        url = reverse('api-stock-scan-inbound')
+
+        def scan():
+            client = APIClient()
+            client.force_authenticate(user=self.user)
+
+            try:
+                start_barrier.wait(timeout=10)
+                response = client.post(
+                    url,
+                    {
+                        'barcode': self.part.IPN,
+                        'client_event_id': str(uuid.uuid4()),
+                        'destination_location': self.location.pk,
+                    },
+                    format='json',
+                )
+                with results_lock:
+                    results.append(response.status_code)
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                with results_lock:
+                    errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=scan) for _ in range(n_threads)]
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join(timeout=15)
+
+        for thread in threads:
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [201] * n_threads)
+
+        stock_items = StockItem.objects.filter(part=self.part, location=self.location)
+        self.assertEqual(stock_items.count(), 1)
+        self.assertEqual(stock_items.get().quantity, n_threads)
+        self.assertFalse(stock_items.get().is_scan_inbound_item)
+
+        events = ScanStockEvent.objects.filter(part=self.part)
+        self.assertEqual(events.count(), n_threads)
+        self.assertEqual(
+            events.filter(outcome=ScanStockEvent.Outcome.SUCCESS).count(), n_threads
+        )
+        self.assertEqual(
+            sorted(events.values_list('stock_item_quantity_after', flat=True)),
+            list(range(1, n_threads + 1)),
+        )
+        self.assertEqual(
+            StockItemTracking.objects.filter(
+                item=stock_items.get(), scan_event__in=events
+            ).count(),
+            n_threads,
+        )
+
+    def test_concurrent_retries_add_stock_once(self):
+        """Concurrent requests for one client event are one logical scan."""
+        n_threads = 5
+        start_barrier = threading.Barrier(n_threads, timeout=10)
+        results = []
+        errors = []
+        results_lock = threading.Lock()
+        client_event_id = str(uuid.uuid4())
+        url = reverse('api-stock-scan-inbound')
+
+        def retry_scan():
+            client = APIClient()
+            client.force_authenticate(user=self.user)
+
+            try:
+                start_barrier.wait(timeout=10)
+                response = client.post(
+                    url,
+                    {
+                        'barcode': self.part.IPN,
+                        'client_event_id': client_event_id,
+                        'destination_location': self.location.pk,
+                    },
+                    format='json',
+                )
+                with results_lock:
+                    results.append((response.status_code, response.data['replayed']))
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                with results_lock:
+                    errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=retry_scan) for _ in range(n_threads)]
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join(timeout=15)
+
+        for thread in threads:
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sorted(results), [(200, True)] * (n_threads - 1) + [(201, False)]
+        )
+        item = StockItem.objects.get(part=self.part, location=self.location)
+        event = ScanStockEvent.objects.get(part=self.part)
+        self.assertEqual(item.quantity, 1)
+        self.assertFalse(item.is_scan_inbound_item)
+        self.assertEqual(event.replay_count, n_threads - 1)
+        self.assertEqual(
+            StockItemTracking.objects.filter(item=item, scan_event=event).count(), 1
+        )
+
+    def test_concurrent_unknown_barcode_registration_creates_one_part(self):
+        """Two terminals can register one barcode without duplicating its Part."""
+        n_threads = 2
+        barcode = '880000000092'
+        start_barrier = threading.Barrier(n_threads, timeout=10)
+        results = []
+        errors = []
+        results_lock = threading.Lock()
+        url = reverse('api-stock-scan-inbound')
+
+        def register_and_scan():
+            client = APIClient()
+            client.force_authenticate(user=self.user)
+
+            try:
+                start_barrier.wait(timeout=10)
+                response = client.post(
+                    url,
+                    {
+                        'barcode': barcode,
+                        'client_event_id': str(uuid.uuid4()),
+                        'destination_location': self.location.pk,
+                        'create_part': {
+                            'name': 'Concurrent newly scanned part',
+                            'default_location': self.location.pk,
+                        },
+                    },
+                    format='json',
+                )
+                with results_lock:
+                    results.append(
+                        (response.status_code, response.data.get('part_created'))
+                    )
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                with results_lock:
+                    errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=register_and_scan) for _ in range(n_threads)]
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join(timeout=15)
+
+        for thread in threads:
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [(201, False), (201, True)])
+
+        parts = Part.objects.filter(IPN=barcode)
+        self.assertEqual(parts.count(), 1)
+        part = parts.get()
+        self.assertEqual(part.barcode_data, '')
+        item = StockItem.objects.get(part=part, location=self.location)
+        self.assertEqual(item.quantity, n_threads)
+        self.assertFalse(item.is_scan_inbound_item)
+        self.assertEqual(ScanStockEvent.objects.filter(part=part).count(), n_threads)
+
+    def test_concurrent_conflicting_registration_does_not_silently_inbound(self):
+        """A losing terminal must not inbound against conflicting product details."""
+        barcode = '880000000088'
+        start_barrier = threading.Barrier(2, timeout=10)
+        results = []
+        errors = []
+        results_lock = threading.Lock()
+        url = reverse('api-stock-scan-inbound')
+
+        def register_and_scan(index):
+            client = APIClient()
+            client.force_authenticate(user=self.user)
+
+            try:
+                start_barrier.wait(timeout=10)
+                response = client.post(
+                    url,
+                    {
+                        'barcode': barcode,
+                        'client_event_id': str(uuid.uuid4()),
+                        'destination_location': self.location.pk,
+                        'create_part': {
+                            'name': f'Conflicting scanned part {index}',
+                            'default_location': self.location.pk,
+                        },
+                    },
+                    format='json',
+                )
+                with results_lock:
+                    results.append(
+                        (response.status_code, response.data.get('error_code'))
+                    )
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                with results_lock:
+                    errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [
+            threading.Thread(target=register_and_scan, args=(index,))
+            for index in range(2)
+        ]
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join(timeout=15)
+
+        for thread in threads:
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sorted(results), [(201, ''), (400, 'IPN_REGISTRATION_CONFLICT')]
+        )
+
+        parts = Part.objects.filter(IPN=barcode)
+        self.assertEqual(parts.count(), 1)
+        part = parts.get()
+        item = StockItem.objects.get(part=part, location=self.location)
+        self.assertEqual(item.quantity, 1)
+        self.assertFalse(item.is_scan_inbound_item)
+        self.assertEqual(
+            ScanStockEvent.objects.filter(
+                part=part, outcome=ScanStockEvent.Outcome.SUCCESS
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            ScanStockEvent.objects.filter(
+                outcome=ScanStockEvent.Outcome.FAILED,
+                error_code='IPN_REGISTRATION_CONFLICT',
+            ).count(),
+            1,
+        )
 
 
 @skipUnlessDBFeature('has_select_for_update')

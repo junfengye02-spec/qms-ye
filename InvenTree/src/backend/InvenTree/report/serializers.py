@@ -134,7 +134,7 @@ class LabelPrintSerializer(serializers.Serializer):
     class Meta:
         """Metaclass options."""
 
-        fields = ['template', 'items', 'plugin']
+        fields = ['template', 'items', 'plugin', 'copies']
 
     def __init__(self, *args, **kwargs):
         """Override the constructor to add the extra plugin fields."""
@@ -147,12 +147,14 @@ class LabelPrintSerializer(serializers.Serializer):
         class Meta(self.Meta):
             """Per-instance metaclass options."""
 
-            fields = ['template', 'items', 'plugin']
+            fields = ['template', 'items', 'plugin', 'copies']
 
         self.Meta = Meta
 
         if plugin_serializer := kwargs.pop('plugin_serializer', None):
             for key, field in plugin_serializer.fields.items():
+                if key in self.Meta.fields:
+                    continue
                 self.Meta.fields.append(key)
                 setattr(self, key, field)
 
@@ -182,6 +184,14 @@ class LabelPrintSerializer(serializers.Serializer):
         allow_empty=False,
         label=_('Items'),
         help_text=_('List of item primary keys to include in the report'),
+    )
+
+    copies = serializers.IntegerField(
+        default=1,
+        min_value=1,
+        max_value=report.models.MAX_LABELS_PER_PRINT,
+        label=_('Copies'),
+        help_text=_('Number of copies to print for each selected label'),
     )
 
 
