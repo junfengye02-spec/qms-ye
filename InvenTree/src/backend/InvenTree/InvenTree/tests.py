@@ -1657,6 +1657,23 @@ class BarcodeMixinTest(InvenTreeTestCase):
         for barcode, expected in hashing_tests.items():
             self.assertEqual(InvenTree.helpers.hash_barcode(barcode), expected)
 
+    def test_barcode_mask(self):
+        """Barcode masking retains only the first and last two characters."""
+        self.assertEqual(InvenTree.helpers.mask_barcode(''), '')
+        self.assertEqual(InvenTree.helpers.mask_barcode('1234'), '****')
+        self.assertEqual(
+            InvenTree.helpers.mask_barcode('6901234567890'), '69*********90'
+        )
+
+    def test_part_ipn_hash(self):
+        """Part IPN hashing is trimmed, case insensitive, and blank aware."""
+        self.assertIsNone(InvenTree.helpers.hash_part_ipn(None))
+        self.assertIsNone(InvenTree.helpers.hash_part_ipn('  '))
+        self.assertEqual(
+            InvenTree.helpers.hash_part_ipn(' CP-1001 '),
+            InvenTree.helpers.hash_part_ipn('cp-1001'),
+        )
+
 
 class SanitizerTest(TestCase):
     """Simple tests for sanitizer functions."""

@@ -1027,6 +1027,24 @@ def hash_barcode(barcode_data: str) -> str:
     return str(barcode_hash.hexdigest())
 
 
+def mask_barcode(barcode_data: str) -> str:
+    """Mask barcode data while retaining two characters at each end."""
+    barcode = str(barcode_data or '')
+
+    if len(barcode) <= 4:
+        return '*' * len(barcode)
+
+    return f'{barcode[:2]}{"*" * (len(barcode) - 4)}{barcode[-2:]}'
+
+
+def hash_part_ipn(ipn: str | None) -> str | None:
+    """Return a stable case-insensitive hash for a non-empty Part IPN."""
+    normalized = str(ipn or '').strip().casefold()
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
 def current_time(local=True):
     """Return the current date and time as a datetime object.
 
