@@ -9,6 +9,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
 import { api } from '../../App';
 import { extractAvailableFields } from '../../functions/forms';
+import { LOCAL_PRINT_URL } from '../../functions/printing/LocalPrintClient';
 import useDataOutput from '../../hooks/UseDataOutput';
 import { useCreateApiFormModal } from '../../hooks/UseForm';
 import { useLocalState } from '../../states/LocalState';
@@ -16,7 +17,12 @@ import {
   useGlobalSettingsState,
   useUserSettingsState
 } from '../../states/SettingsStates';
+import { useUserState } from '../../states/UserState';
 import { ActionDropdown } from '../items/ActionDropdown';
+import {
+  type LocalPrintConfig,
+  LocalPrintModal
+} from '../printing/LocalPrintModal';
 
 export function PrintingActions({
   items,
@@ -34,6 +40,23 @@ export function PrintingActions({
   const userSettings = useUserSettingsState();
   const globalSettings = useGlobalSettingsState();
   const localState = useLocalState();
+  const userId = useUserState((state) => state.user?.pk);
+  const [localPrintOpen, setLocalPrintOpen] = useState(false);
+  const localPrintConfig = useQuery<LocalPrintConfig>({
+    queryKey: ['local-print-config', userId],
+    enabled:
+      !!enableLabels && (modelType === 'part' || modelType === 'stockitem'),
+    queryFn: async () => (await api.get(`${LOCAL_PRINT_URL}config/`)).data,
+    staleTime: 30000
+  });
+  const openLabels = () => {
+    if (
+      localPrintConfig.data?.enabled &&
+      (modelType === 'part' || modelType === 'stockitem')
+    ) {
+      setLocalPrintOpen(true);
+    } else labelModal.open();
+  };
 
   const lastUsedPrinting = useMemo(() => {
     return modelType ? localState.lastUsedPrinting[modelType] : undefined;
@@ -61,8 +84,8 @@ export function PrintingActions({
         if (event.repeat) {
           return;
         }
-        if (enabled && !hidden) {
-          labelModal.open();
+        if (enabled && !hidden && modelType !== 'part') {
+          openLabels();
         }
       }
     ]
@@ -76,8 +99,12 @@ export function PrintingActions({
   const [pluginKey, setPluginKey] = useState<string | null>(null);
 
   const labelPrintingEnabled = useMemo(() => {
-    return enableLabels && globalSettings.isSet('LABEL_ENABLE');
-  }, [enableLabels, globalSettings]);
+    return (
+      enableLabels &&
+      modelType !== 'part' &&
+      globalSettings.isSet('LABEL_ENABLE')
+    );
+  }, [enableLabels, globalSettings, modelType]);
 
   const reportPrintingEnabled = useMemo(() => {
     return enableReports && globalSettings.isSet('REPORT_ENABLE');
@@ -237,6 +264,15 @@ export function PrintingActions({
       <>
         {reportModal.modal}
         {labelModal.modal}
+        {localPrintOpen && localPrintConfig.data && (
+          <LocalPrintModal
+            key={`${userId}-${modelType}`}
+            items={items}
+            modelType={modelType}
+            config={localPrintConfig.data}
+            onClose={() => setLocalPrintOpen(false)}
+          />
+        )}
         <ActionDropdown
           tooltip={t`Printing Actions`}
           icon={<IconPrinter />}
@@ -246,7 +282,7 @@ export function PrintingActions({
             {
               name: t`Print Labels`,
               icon: <IconTags />,
-              onClick: () => labelModal.open(),
+              onClick: openLabels,
               hidden: !labelPrintingEnabled
             },
             {

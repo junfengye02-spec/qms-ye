@@ -3931,6 +3931,11 @@ quansync@^0.2.11:
   resolved "https://registry.yarnpkg.com/quansync/-/quansync-0.2.11.tgz#f9c3adda2e1272e4f8cf3f1457b04cbdb4ee692a"
   integrity sha512-AifT7QEbW9Nri4tAwR5M/uzpBuqfZf+zwaEM/QkzEjj7NBuFD2rBuy0K3dE+8wltbezDV7JMA0WfnCPYRSYbXA==
 
+qz-tray@2.2.5:
+  version "2.2.5"
+  resolved "https://registry.yarnpkg.com/qz-tray/-/qz-tray-2.2.5.tgz#2cf20163f0c1c4c530682007f267e3546a489ac0"
+  integrity sha512-ZPdjFLX1K9j+9v49ertN/QABBhPjUQLQSAQLkSWBrkHLpSv7/rTLLx0NcNMAquCq+WV7Ep4Aw00NJOXMQuMXOA==
+
 react-dom@^19.2.7:
   version "19.2.7"
   resolved "https://registry.yarnpkg.com/react-dom/-/react-dom-19.2.7.tgz#0450dc9ae9ddbff76ef196401cd8b8c7fb466ccc"
