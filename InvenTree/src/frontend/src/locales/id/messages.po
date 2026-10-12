@@ -13690,3 +13690,167 @@ msgstr ""
 msgid "Ignore and continue to Desktop view"
 msgstr ""
 
+
+#: src/components/printing/LocalPrintModal.tsx:38
+msgid "正在生成 PDF"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:39
+msgid "PDF 已就绪，等待提交"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:40
+msgid "正在提交，请勿重复打印"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:41
+msgid "已提交到本机打印队列"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:42
+msgid "结果待确认，请检查 Windows 打印队列后决定是否补打"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:43
+msgid "任务失败，可下载已有 PDF 或创建补打任务"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:55
+msgid "服务端拒绝了此操作："
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:59
+msgid "登录已变化，已停止发送。请重新打开打印窗口。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:60
+msgid "打印组件版本不支持，请安装管理员指定的版本。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:61
+msgid "证书或信任验证失败，请检查本站信任和服务端签名证书。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:62
+msgid "浏览器阻止了本机连接，请检查本站的本地网络访问权限。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:63
+msgid "连接或提交超时。请检查组件和系统队列，不要直接重复打印。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:64
+msgid "所选打印机已不可用，请刷新列表并重新选择。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:65
+msgid "操作未完成。请检查打印组件是否运行、登录权限和服务端配置。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:276
+msgid "本机标签打印"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:283
+msgid "商品 IPN 标签 · 50 × 30 mm"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:287
+msgid "标签已按份数生成。提交成功只表示进入本机队列，请检查实际出纸。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:294
+msgid "安装打印组件"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:300
+msgid "刷新打印机"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:300
+msgid "重新检测"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:306
+msgid "下载 PDF"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:310
+msgid "上次创建请求的结果尚未确认。先查询该请求，再决定是否提交，避免重复创建。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:318
+msgid "查询上次请求"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:322
+msgid "Windows 安装说明"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:324
+msgid "先安装打印机厂商驱动，并确认 Windows 测试页能打印。安装 QZ Tray，允许登录自启，完成管理员提供的本站信任设置，再返回此处重新检测。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:326
+msgid "要求组件版本："
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:334
+msgid "下载管理员指定安装包"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:336
+msgid "尚未配置经过验证的安装包，请联系管理员。当前可下载 PDF。"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:342
+msgid "本机打印机"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:343
+msgid "请选择打印机"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:343
+msgid "请先检测打印组件"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:359
+msgid "每件份数"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:368
+msgid "总张数："
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:383
+msgid "任务："
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:387
+msgid "目标队列："
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:396
+msgid "我已检查系统队列和实际标签，确认需要重新打印这些标签"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:406
+msgid "创建补打任务"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:420
+msgid "继续提交"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:420
+msgid "打印"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:430
+msgid "新建标签任务"
+msgstr ""
+
+#: src/components/printing/LocalPrintModal.tsx:434
+msgid "最近任务（选择后不会自动发送）"
+msgstr ""
