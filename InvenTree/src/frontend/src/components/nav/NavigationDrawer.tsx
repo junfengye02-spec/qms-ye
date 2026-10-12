@@ -1,12 +1,13 @@
+import { StylishText } from '@lib/components/StylishText';
+import { ModelType } from '@lib/enums/ModelType';
+import { UserRoles } from '@lib/enums/Roles';
 import { t } from '@lingui/core/macro';
 import { Container, Drawer, Flex, Group, Space } from '@mantine/core';
 import { useViewportSize } from '@mantine/hooks';
 import { useEffect, useMemo, useRef, useState } from 'react';
-
-import { StylishText } from '@lib/components/StylishText';
-import { ModelType } from '@lib/enums/ModelType';
-import { UserRoles } from '@lib/enums/Roles';
 import { AboutLinks } from '../../defaults/links';
+import { canAccessScanStockNavigation } from '../../functions/stock';
+import { wmsAccess } from '../../functions/wms';
 import useInstanceName from '../../hooks/UseInstanceName';
 import * as classes from '../../main.css';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
@@ -43,6 +44,10 @@ function DrawerContent({ closeFunc }: Readonly<{ closeFunc?: () => void }>) {
   const user = useUserState();
 
   const globalSettings = useGlobalSettingsState();
+  const warehouse = wmsAccess(
+    user.user,
+    globalSettings.isSet('SCAN_APPROVAL_ENABLED')
+  );
 
   const [scrollHeight, setScrollHeight] = useState(0);
   const ref = useRef(null);
@@ -80,6 +85,20 @@ function DrawerContent({ closeFunc }: Readonly<{ closeFunc?: () => void }>) {
         icon: 'stock'
       },
       {
+        id: 'scan-stock',
+        title: t`Scan stock`,
+        description: t`Scan products for inbound and outbound stock operations`,
+        link: '/stock/scan/inbound/',
+        hidden: !canAccessScanStockNavigation({
+          approvalEnabled: globalSettings.isSet('SCAN_APPROVAL_ENABLED'),
+          canViewStock: user.hasViewPermission(ModelType.stockitem),
+          canChangeStock: user.hasChangePermission(ModelType.stockitem),
+          scanApprovalPermissions:
+            user.getUser()?.permissions?.scanstockapprovalrequest
+        }),
+        icon: 'barcode'
+      },
+      {
         id: 'build',
         title: t`Manufacturing`,
         link: '/manufacturing/',
@@ -112,8 +131,12 @@ function DrawerContent({ closeFunc }: Readonly<{ closeFunc?: () => void }>) {
         link: '/core/index/groups',
         icon: 'group'
       }
-    ];
-  }, [user]);
+    ].filter(
+      (item) =>
+        !warehouse.restricted ||
+        ['parts', 'stock', 'scan-stock'].includes(item.id)
+    );
+  }, [user, globalSettings]);
 
   const menuItemsAction: MenuLinkItem[] = useMemo(() => {
     return [
@@ -122,7 +145,7 @@ function DrawerContent({ closeFunc }: Readonly<{ closeFunc?: () => void }>) {
         title: t`Scan Barcode`,
         link: '/scan',
         icon: 'barcode',
-        hidden: !globalSettings.isSet('BARCODE_ENABLE')
+        hidden: warehouse.restricted || !globalSettings.isSet('BARCODE_ENABLE')
       }
     ];
   }, [user, globalSettings]);
@@ -159,8 +182,8 @@ function DrawerContent({ closeFunc }: Readonly<{ closeFunc?: () => void }>) {
   }, [user]);
 
   const menuItemsAbout: MenuLinkItem[] = useMemo(
-    () => AboutLinks(globalSettings, user),
-    []
+    () => (warehouse.restricted ? [] : AboutLinks(globalSettings, user)),
+    [warehouse.restricted, globalSettings, user]
   );
 
   return (

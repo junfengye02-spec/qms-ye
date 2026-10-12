@@ -9,7 +9,7 @@ import {
   IconX
 } from '@tabler/icons-react';
 import { type CameraDevice, Html5Qrcode } from 'html5-qrcode';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Expand from '../items/Expand';
 import type { BarcodeInputProps } from './BarcodeInput';
 
@@ -26,19 +26,44 @@ export default function BarcodeCameraInput({
   const [scanningEnabled, setScanningEnabled] = useState<boolean>(false);
   const [wasAutoPaused, setWasAutoPaused] = useState<boolean>(false);
   const documentState = useDocumentVisibility();
-
-  let lastValue = '';
+  const lastValue = useRef('');
 
   // Mount QR code once we are loaded
   useEffect(() => {
-    setQrCodeScanner(new Html5Qrcode('reader'));
+    const scanner = new Html5Qrcode('reader');
+    let mounted = true;
+
+    setQrCodeScanner(scanner);
 
     // load cameras
     Html5Qrcode.getCameras().then((devices) => {
-      if (devices?.length) {
+      if (mounted && devices?.length) {
         setCameras(devices);
       }
     });
+
+    return () => {
+      mounted = false;
+
+      const clearScanner = () => {
+        try {
+          scanner.clear();
+        } catch (error) {
+          console.warn('Could not clear barcode camera', error);
+        }
+      };
+
+      if (scanner.isScanning) {
+        void scanner
+          .stop()
+          .catch((error) => {
+            console.warn('Could not stop barcode camera', error);
+          })
+          .then(clearScanner);
+      } else {
+        clearScanner();
+      }
+    };
   }, []);
 
   // set camera value from id
@@ -64,11 +89,11 @@ export default function BarcodeCameraInput({
     qrCodeScanner?.pause();
 
     // dedouplication
-    if (decodedText === lastValue) {
+    if (decodedText === lastValue.current) {
       qrCodeScanner?.resume();
       return;
     }
-    lastValue = decodedText;
+    lastValue.current = decodedText;
 
     // submit value upstream
     onScan?.(decodedText);

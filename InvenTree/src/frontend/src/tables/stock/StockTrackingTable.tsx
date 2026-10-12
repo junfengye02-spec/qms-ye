@@ -1,5 +1,5 @@
 import { t } from '@lingui/core/macro';
-import { Table, Text } from '@mantine/core';
+import { Group, Table, Text } from '@mantine/core';
 import { type ReactNode, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 
@@ -46,20 +46,61 @@ type StockTrackingEntry = {
   details: ReactNode;
 };
 
+export type StockTrackingScope = 'global' | 'part' | 'item';
+
 export function StockTrackingTable({
   itemId,
-  partId
+  partId,
+  scope
 }: Readonly<{
   itemId?: number;
   partId?: number;
+  scope?: StockTrackingScope;
 }>) {
   const navigate = useNavigate();
-  const table = useTable(partId ? 'part_stock_tracking' : 'stock_tracking');
+  const resolvedScope: StockTrackingScope =
+    scope ?? (itemId ? 'item' : partId ? 'part' : 'global');
+  const table = useTable(
+    resolvedScope === 'part'
+      ? 'part_stock_tracking'
+      : resolvedScope === 'global'
+        ? 'global_stock_tracking'
+        : 'stock_tracking'
+  );
 
   // Render "details" for a stock tracking record
   const renderDetails = useCallback(
     (record: any) => {
       const deltas: any = record?.deltas ?? {};
+      const destination = deltas.location_detail
+        ? RenderStockLocation({
+            instance: deltas.location_detail,
+            link: true,
+            navigate: navigate
+          })
+        : null;
+      const source = deltas.old_location_detail
+        ? RenderStockLocation({
+            instance: deltas.old_location_detail,
+            link: true,
+            navigate: navigate
+          })
+        : null;
+      const locationDetails =
+        record.tracking_type === 20 && deltas.location ? (
+          <Group gap='xs' wrap='nowrap'>
+            {source ?? <Text c='dimmed'>{t`Unknown location`}</Text>}
+            <Text aria-hidden='true'>→</Text>
+            {destination ?? <Text c='dimmed'>{t`Unknown location`}</Text>}
+          </Group>
+        ) : (
+          destination
+        );
+      const quantityLabel = [10, 11, 12].includes(record.tracking_type)
+        ? t`Stock after operation`
+        : record.tracking_type === 20
+          ? t`Quantity moved`
+          : t`Quantity`;
 
       const entries: StockTrackingEntry[] = [
         {
@@ -102,7 +143,7 @@ export function StockTrackingTable({
             })
         },
         {
-          label: t`Quantity`,
+          label: quantityLabel,
           key: 'quantity',
           details: formatDecimal(deltas.quantity)
         },
@@ -128,15 +169,12 @@ export function StockTrackingTable({
             })
         },
         {
-          label: t`Location`,
+          label:
+            record.tracking_type === 20
+              ? t`Source and destination`
+              : t`Location`,
           key: 'location',
-          details:
-            deltas.location_detail &&
-            RenderStockLocation({
-              instance: deltas.location_detail,
-              link: true,
-              navigate: navigate
-            })
+          details: locationDetails
         },
         {
           label: t`Build Order`,
@@ -203,6 +241,11 @@ export function StockTrackingTable({
               link: true,
               navigate: navigate
             })
+        },
+        {
+          label: t`Scan event`,
+          key: 'scan_event',
+          details: record.scan_event ? `#${record.scan_event}` : null
         }
       ];
 
@@ -249,11 +292,11 @@ export function StockTrackingTable({
         title: t`Part`,
         part: 'part_detail',
         switchable: true,
-        hidden: !partId
+        hidden: resolvedScope === 'item'
       }),
       IPNColumn({
         defaultVisible: false,
-        hidden: !partId
+        hidden: resolvedScope === 'item'
       }),
       StockColumn({
         title: t`Stock Item`,
@@ -263,7 +306,7 @@ export function StockTrackingTable({
         ),
         sortable: false,
         switchable: false,
-        hidden: !partId
+        hidden: resolvedScope === 'item'
       }),
       DescriptionColumn({
         accessor: 'label'
@@ -282,17 +325,36 @@ export function StockTrackingTable({
       },
       {
         accessor: 'user',
-        title: t`User`,
+        title: t`Operator`,
         render: (record: any) => {
-          if (!record.user_detail) {
-            return <Text size='sm' fs='italic'>{t`No user information`}</Text>;
+          if (record.user_detail) {
+            return RenderUser({ instance: record.user_detail });
           }
 
-          return RenderUser({ instance: record.user_detail });
+          const snapshot =
+            record.operator_display_name_snapshot ||
+            record.operator_username_snapshot ||
+            (record.operator_user_id_snapshot
+              ? t`User #${record.operator_user_id_snapshot}`
+              : '');
+
+          return snapshot ? (
+            <Text size='sm'>{snapshot}</Text>
+          ) : (
+            <Text size='sm' fs='italic'>{t`No user information`}</Text>
+          );
         }
+      },
+      {
+        accessor: 'scan_event',
+        title: t`Scan event`,
+        sortable: false,
+        switchable: true,
+        render: (record: any) =>
+          record.scan_event ? `#${record.scan_event}` : '-'
       }
     ];
-  }, []);
+  }, [renderDetails, resolvedScope]);
 
   return (
     <InvenTreeTable
@@ -303,13 +365,13 @@ export function StockTrackingTable({
         params: {
           item: itemId,
           part: partId,
-          part_detail: partId ? true : undefined,
-          item_detail: partId ? true : undefined,
+          part_detail: resolvedScope === 'item' ? undefined : true,
+          item_detail: resolvedScope === 'item' ? undefined : true,
           user_detail: true
         },
         enableDownload: true,
         tableFilters: filters,
-        modelType: partId ? ModelType.stockitem : undefined,
+        modelType: resolvedScope === 'item' ? undefined : ModelType.stockitem,
         modelField: 'item'
       }}
     />

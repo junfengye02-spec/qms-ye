@@ -6,6 +6,7 @@ import { ModelType } from '@lib/enums/ModelType';
 import { formatDecimal } from '@lib/functions/Formatting';
 import { getDetailUrl } from '@lib/functions/Navigation';
 import { shortenString } from '@lib/functions/String';
+import { stockAvailableQuantity } from '../../functions/stock';
 import { ApiIcon } from '../items/ApiIcon';
 import { TableHoverCard } from '../tables/TableHoverCard';
 import {
@@ -81,7 +82,8 @@ export function RenderStockItem(
   const { instance } = props;
   let quantity_string = '';
 
-  const allocated: number = Math.max(0, instance?.allocated ?? 0);
+  const available = stockAvailableQuantity(instance);
+  const quantity = Math.max(0, Number(instance?.quantity ?? 0));
 
   // Determine if this item is serialized
   const serialized: boolean =
@@ -92,8 +94,7 @@ export function RenderStockItem(
 
   if (serialized) {
     quantity_string += `${t`Serial Number`}: ${instance.serial}`;
-  } else if (allocated > 0) {
-    const available: number = Math.max(0, instance.quantity - allocated);
+  } else if (available < quantity) {
     quantity_string = `${t`Available`}: ${formatDecimal(available)} / ${formatDecimal(instance.quantity)}`;
   } else if (instance?.quantity) {
     quantity_string = `${t`Quantity`}: ${formatDecimal(instance.quantity)}`;

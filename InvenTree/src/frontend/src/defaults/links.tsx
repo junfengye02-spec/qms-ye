@@ -1,11 +1,10 @@
-import { t } from '@lingui/core/macro';
-import { Trans } from '@lingui/react/macro';
-import { openContextModal } from '@mantine/modals';
-
 import { StylishText } from '@lib/components/StylishText';
 import { UserRoles } from '@lib/enums/Roles';
 import type { SettingsStateProps } from '@lib/types/Settings';
 import type { UserStateProps } from '@lib/types/User';
+import { t } from '@lingui/core/macro';
+import { Trans } from '@lingui/react/macro';
+import { openContextModal } from '@mantine/modals';
 import {
   IconBox,
   IconBuildingFactory2,
@@ -16,6 +15,7 @@ import {
 } from '@tabler/icons-react';
 import type { ReactNode } from 'react';
 import type { MenuLinkItem } from '../components/items/MenuLinks';
+import { wmsAccess } from '../functions/wms';
 import { useGlobalSettingsState } from '../states/SettingsStates';
 
 type NavTab = {
@@ -27,6 +27,10 @@ type NavTab = {
 
 export function getNavTabs(user: UserStateProps): NavTab[] {
   const globalSettings = useGlobalSettingsState.getState();
+  const warehouse = wmsAccess(
+    user.user,
+    globalSettings.isSet('SCAN_APPROVAL_ENABLED')
+  );
 
   const navTabs: NavTab[] = [
     {
@@ -75,8 +79,19 @@ export function getNavTabs(user: UserStateProps): NavTab[] {
     }
   ];
 
+  if (warehouse.restricted && (warehouse.canOperate || warehouse.canApprove)) {
+    navTabs.unshift({
+      name: 'stock/scan/inbound/',
+      title: t`Scan stock`,
+      icon: <IconPackages />
+    });
+  }
   return navTabs.filter((tab) => {
-    return tab.visible !== false;
+    return (
+      tab.visible !== false &&
+      (!warehouse.restricted ||
+        ['part', 'stock', 'stock/scan/inbound/'].includes(tab.name))
+    );
   });
 }
 

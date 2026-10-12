@@ -223,7 +223,6 @@ export default function SystemSettings() {
               keys={[
                 'PART_NAME_FORMAT',
                 'PART_IPN_REGEX',
-                'PART_ALLOW_DUPLICATE_IPN',
                 'PART_ALLOW_EDIT_IPN',
                 'PART_ALLOW_DELETE_FROM_ASSEMBLY',
                 'PART_ENABLE_LOCKING',
@@ -301,6 +300,15 @@ export default function SystemSettings() {
               keys={[
                 'STOCK_TRACKING_DELETE_OLD_ENTRIES',
                 'STOCK_TRACKING_DELETE_DAYS'
+              ]}
+            />
+            <GlobalSettingList
+              heading={t`Scan Stock Approval`}
+              keys={[
+                'SCAN_APPROVAL_ENABLED',
+                'SCAN_APPROVAL_DRAFT_TIMEOUT_MINUTES',
+                'SCAN_APPROVAL_PENDING_TIMEOUT_MINUTES',
+                'SCAN_APPROVAL_MAX_LINES'
               ]}
             />
           </Stack>

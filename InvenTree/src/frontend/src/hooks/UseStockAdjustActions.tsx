@@ -18,6 +18,8 @@ import {
   useTransferStockItem
 } from '../forms/StockForms';
 import { InvenTreeIcon } from '../functions/icons';
+import { wmsAccess } from '../functions/wms';
+import { useGlobalSettingsState } from '../states/SettingsStates';
 import { useUserState } from '../states/UserState';
 
 interface StockAdjustActionProps {
@@ -52,6 +54,11 @@ export function useStockAdjustActions(
   props: StockAdjustActionProps
 ): StockAdjustActionReturnProps {
   const user = useUserState();
+  const settings = useGlobalSettingsState();
+  const restricted = wmsAccess(
+    user.user,
+    settings.isSet('SCAN_APPROVAL_ENABLED')
+  ).restricted;
 
   // The available modals for stock adjustment actions
   const addStock = useAddStockItem(props.formProps);
@@ -69,7 +76,7 @@ export function useStockAdjustActions(
   const modals: UseModalReturn[] = useMemo(() => {
     const modals: UseModalReturn[] = [];
 
-    if (!user.hasChangeRole(UserRoles.stock)) {
+    if (restricted || !user.hasChangeRole(UserRoles.stock)) {
       return [];
     }
 
@@ -87,13 +94,13 @@ export function useStockAdjustActions(
       modals.push(deleteStock);
 
     return modals;
-  }, [props, user]);
+  }, [props, user, restricted]);
 
   // Construct a list of actions available in the stock adjustment dropdown menu
   const menuActions: ActionDropdownItem[] = useMemo(() => {
     const menuActions: ActionDropdownItem[] = [];
 
-    if (!user.hasChangeRole(UserRoles.stock)) {
+    if (restricted || !user.hasChangeRole(UserRoles.stock)) {
       return [];
     }
 
@@ -199,7 +206,7 @@ export function useStockAdjustActions(
       });
 
     return menuActions;
-  }, [props, user]);
+  }, [props, user, restricted]);
 
   // Determine if there are any items selected
   const hasItems: boolean = useMemo(() => {

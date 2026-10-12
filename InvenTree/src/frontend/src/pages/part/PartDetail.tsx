@@ -1,3 +1,10 @@
+import { ApiEndpoints } from '@lib/enums/ApiEndpoints';
+import { ModelType } from '@lib/enums/ModelType';
+import { UserRoles } from '@lib/enums/Roles';
+import { apiUrl } from '@lib/functions/Api';
+import { getDetailUrl } from '@lib/functions/Navigation';
+import type { StockOperationProps } from '@lib/types/Forms';
+import type { PanelType } from '@lib/types/Panel';
 import { t } from '@lingui/core/macro';
 import {
   ActionIcon,
@@ -39,14 +46,6 @@ import { useQuery } from '@tanstack/react-query';
 import { type ReactNode, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import Select from 'react-select';
-
-import { ApiEndpoints } from '@lib/enums/ApiEndpoints';
-import { ModelType } from '@lib/enums/ModelType';
-import { UserRoles } from '@lib/enums/Roles';
-import { apiUrl } from '@lib/functions/Api';
-import { getDetailUrl } from '@lib/functions/Navigation';
-import type { StockOperationProps } from '@lib/types/Forms';
-import type { PanelType } from '@lib/types/Panel';
 import AdminButton from '../../components/buttons/AdminButton';
 import { PrintingActions } from '../../components/buttons/PrintingActions';
 import StarredToggleButton from '../../components/buttons/StarredToggleButton';
@@ -72,6 +71,7 @@ import { useApi } from '../../contexts/ApiContext';
 import { formatDecimal } from '../../defaults/formatters';
 import { usePartFields } from '../../forms/PartForms';
 import { useFindSerialNumberForm } from '../../forms/StockForms';
+import { wmsAccess } from '../../functions/wms';
 import {
   useCreateApiFormModal,
   useDeleteApiFormModal,
@@ -97,23 +97,17 @@ import { RelatedPartTable } from '../../tables/part/RelatedPartTable';
 import { ReturnOrderTable } from '../../tables/sales/ReturnOrderTable';
 import { StockItemTable } from '../../tables/stock/StockItemTable';
 import { TransferOrderTable } from '../../tables/stock/TransferOrderTable';
+import { BomActions } from './bom/BomActions';
 import PartAllocationPanel from './PartAllocationPanel';
 import { PartDetailsPanel } from './PartDetailsPanel';
 import PartPricingPanel from './PartPricingPanel';
 import PartStockHistoryDetail from './PartStockHistoryDetail';
 import PartSupplierDetail from './PartSupplierDetail';
-import { BomActions } from './bom/BomActions';
 
 /**
  * Render a part revision selector component
  */
-function RevisionSelector({
-  part,
-  options
-}: {
-  part: any;
-  options: any[];
-}) {
+function RevisionSelector({ part, options }: { part: any; options: any[] }) {
   const navigate = useNavigate();
 
   return (
@@ -158,6 +152,10 @@ export default function PartDetail() {
   const [treeOpen, setTreeOpen] = useState(false);
 
   const globalSettings = useGlobalSettingsState();
+  const restricted = wmsAccess(
+    user.user,
+    globalSettings.isSet('SCAN_APPROVAL_ENABLED')
+  ).restricted;
   const userSettings = useUserSettingsState();
 
   // BOM validation information (used for hover-over info on the BOM tab)
@@ -516,7 +514,13 @@ export default function PartDetail() {
         model_id: part?.pk,
         has_note: !!part?.notes
       })
-    ];
+    ].filter(
+      (panel) =>
+        !restricted ||
+        ['details', 'stock', 'parameters', 'attachments', 'notes'].includes(
+          panel.name
+        )
+    );
   }, [
     id,
     part,

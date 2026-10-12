@@ -56,6 +56,10 @@ export const StockDetail = Loadable(
   lazy(() => import('./pages/stock/StockDetail'))
 );
 
+export const ScanStock = Loadable(
+  lazy(() => import('./pages/stock/ScanStockPage'))
+);
+
 export const BuildIndex = Loadable(
   lazy(() => import('./pages/build/BuildIndex'))
 );
@@ -181,6 +185,12 @@ export const routes = (
       </Route>
       <Route path='stock/'>
         <Route index element={<Navigate to='location/index/' />} />
+        <Route
+          path='scan-inbound/'
+          element={<Navigate replace to='/stock/scan/inbound/' />}
+        />
+        <Route path='scan/inbound/' element={<ScanStock />} />
+        <Route path='scan/outbound/' element={<ScanStock />} />
         <Route path='location/:id?/*' element={<LocationDetail />} />
         <Route path='item/:id/*' element={<StockDetail />} />
         <Route path='transfer-order/:id/*' element={<TransferOrderDetail />} />

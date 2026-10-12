@@ -1,5 +1,14 @@
+import { StylishText } from '@lib/components/StylishText';
+import { ApiEndpoints } from '@lib/enums/ApiEndpoints';
+import { ModelType } from '@lib/enums/ModelType';
+import { UserRoles } from '@lib/enums/Roles';
+import { apiUrl } from '@lib/functions/Api';
+import { getDetailUrl, getOverviewUrl } from '@lib/functions/Navigation';
+import type { ApiFormFieldSet, StockOperationProps } from '@lib/types/Forms';
+import type { PanelType } from '@lib/types/Panel';
 import { t } from '@lingui/core/macro';
 import { Accordion, Skeleton, Stack } from '@mantine/core';
+import { notifications } from '@mantine/notifications';
 import {
   IconArrowsSplit,
   IconBookmark,
@@ -15,16 +24,6 @@ import {
 import { useQuery } from '@tanstack/react-query';
 import { type ReactNode, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-
-import { StylishText } from '@lib/components/StylishText';
-import { ApiEndpoints } from '@lib/enums/ApiEndpoints';
-import { ModelType } from '@lib/enums/ModelType';
-import { UserRoles } from '@lib/enums/Roles';
-import { apiUrl } from '@lib/functions/Api';
-import { getDetailUrl, getOverviewUrl } from '@lib/functions/Navigation';
-import type { ApiFormFieldSet, StockOperationProps } from '@lib/types/Forms';
-import type { PanelType } from '@lib/types/Panel';
-import { notifications } from '@mantine/notifications';
 import { useBarcodeScanDialog } from '../../components/barcodes/BarcodeScanDialog';
 import AdminButton from '../../components/buttons/AdminButton';
 import { PrintingActions } from '../../components/buttons/PrintingActions';
@@ -55,6 +54,11 @@ import {
 } from '../../forms/StockForms';
 import { InvenTreeIcon } from '../../functions/icons';
 import {
+  stockAvailableQuantity,
+  stockFrozenQuantity
+} from '../../functions/stock';
+import { wmsAccess } from '../../functions/wms';
+import {
   useCreateApiFormModal,
   useDeleteApiFormModal,
   useEditApiFormModal
@@ -79,6 +83,10 @@ export default function StockDetail() {
   const user = useUserState();
 
   const globalSettings = useGlobalSettingsState();
+  const restricted = wmsAccess(
+    user.user,
+    globalSettings.isSet('SCAN_APPROVAL_ENABLED')
+  ).restricted;
 
   const enableExpiry = useMemo(
     () => globalSettings.isSet('STOCK_ENABLE_EXPIRY'),
@@ -185,7 +193,7 @@ export default function StockDetail() {
         content: (
           <StockDetailsPanel
             instance={stockitem}
-            allowImageEdit
+            allowImageEdit={!restricted}
             showSerialNav
             refreshInstance={refreshInstance}
           />
@@ -314,14 +322,19 @@ export default function StockDetail() {
         model_id: stockitem.pk,
         has_note: !!stockitem.notes
       })
-    ];
+    ].filter(
+      (panel) =>
+        !restricted ||
+        ['details', 'tracking', 'attachments', 'notes'].includes(panel.name)
+    );
   }, [
     showSalesAllocations,
     showBuildAllocations,
     showInstalledItems,
     stockitem,
     id,
-    user
+    user,
+    restricted
   ]);
 
   const breadcrumbs = useMemo(
@@ -506,7 +519,7 @@ export default function StockDetail() {
   });
 
   const scanIntoLocation = useBarcodeScanDialog({
-    title: t`Scan Into Location`,
+    title: t`Scan location and move stock`,
     modelType: ModelType.stocklocation,
     callback: async (barcode, response) => {
       const pk = response.stocklocation.pk;
@@ -554,12 +567,12 @@ export default function StockDetail() {
         model={ModelType.stockitem}
         pk={stockitem.pk}
         hash={stockitem?.barcode_hash}
-        perm={user.hasChangeRole(UserRoles.stock)}
+        perm={!restricted && user.hasChangeRole(UserRoles.stock)}
         actions={[
           {
-            name: t`Scan into location`,
+            name: t`Scan location and move stock`,
             icon: <InvenTreeIcon icon='location' />,
-            tooltip: t`Scan this item into a location`,
+            tooltip: t`Scan a location barcode and move this stock item without changing its quantity`,
             onClick: scanIntoLocation.open
           }
         ]}
@@ -573,76 +586,89 @@ export default function StockDetail() {
       <ActionDropdown
         tooltip={t`Stock Operations`}
         icon={<IconPackages />}
-        actions={[
-          ...stockAdjustActions.menuActions,
-          {
-            name: t`Serialize`,
-            tooltip: t`Serialize stock`,
-            hidden:
-              serialized ||
-              stockitem?.quantity < 1 ||
-              stockitem?.part_detail?.trackable != true,
-            icon: <InvenTreeIcon icon='serial' iconProps={{ color: 'blue' }} />,
-            onClick: () => {
-              serializeStockItem.open();
-            }
-          },
-          {
-            name: t`Disassemble`,
-            tooltip: t`Disassemble this stock item into its component parts`,
-            hidden:
-              !user.hasAddRole(UserRoles.stock) ||
-              !stockitem.in_stock ||
-              stockitem.part_detail?.assembly != true,
-            icon: <IconArrowsSplit color='blue' />,
-            onClick: () => {
-              disassembleStockItem.open();
-            }
-          },
-          {
-            name: t`Order`,
-            tooltip: t`Order Stock`,
-            hidden:
-              !user.hasAddRole(UserRoles.purchase_order) ||
-              !stockitem.part_detail?.active ||
-              !stockitem.part_detail?.purchaseable,
-            icon: <IconShoppingCart color='blue' />,
-            onClick: () => {
-              orderPartsWizard.openWizard();
-            }
-          }
-        ]}
+        actions={
+          restricted
+            ? []
+            : [
+                ...stockAdjustActions.menuActions,
+                {
+                  name: t`Serialize`,
+                  tooltip: t`Serialize stock`,
+                  hidden:
+                    serialized ||
+                    stockitem?.quantity < 1 ||
+                    stockitem?.part_detail?.trackable != true,
+                  icon: (
+                    <InvenTreeIcon
+                      icon='serial'
+                      iconProps={{ color: 'blue' }}
+                    />
+                  ),
+                  onClick: () => {
+                    serializeStockItem.open();
+                  }
+                },
+                {
+                  name: t`Disassemble`,
+                  tooltip: t`Disassemble this stock item into its component parts`,
+                  hidden:
+                    !user.hasAddRole(UserRoles.stock) ||
+                    !stockitem.in_stock ||
+                    stockitem.part_detail?.assembly != true,
+                  icon: <IconArrowsSplit color='blue' />,
+                  onClick: () => {
+                    disassembleStockItem.open();
+                  }
+                },
+                {
+                  name: t`Order`,
+                  tooltip: t`Order Stock`,
+                  hidden:
+                    !user.hasAddRole(UserRoles.purchase_order) ||
+                    !stockitem.part_detail?.active ||
+                    !stockitem.part_detail?.purchaseable,
+                  icon: <IconShoppingCart color='blue' />,
+                  onClick: () => {
+                    orderPartsWizard.openWizard();
+                  }
+                }
+              ]
+        }
       />,
       <OptionsActionDropdown
         tooltip={t`Stock Item Actions`}
-        actions={[
-          DuplicateItemAction({
-            hidden: !user.hasAddRole(UserRoles.stock),
-            onClick: () => duplicateStockItem.open()
-          }),
-          EditItemAction({
-            hidden: !user.hasChangeRole(UserRoles.stock),
-            onClick: () => editStockItem.open()
-          }),
-          {
-            name: t`Convert`,
-            tooltip: t`Convert this stock item to a different part`,
-            hidden: !user.hasChangeRole(UserRoles.stock) || !canConvert,
-            icon: <IconTransform color='blue' />,
-            onClick: () => convertStockItem.open()
-          },
-          DeleteItemAction({
-            hidden: !user.hasDeleteRole(UserRoles.stock),
-            onClick: () => deleteStockItem.open()
-          })
-        ]}
+        actions={
+          restricted
+            ? []
+            : [
+                DuplicateItemAction({
+                  hidden: !user.hasAddRole(UserRoles.stock),
+                  onClick: () => duplicateStockItem.open()
+                }),
+                EditItemAction({
+                  hidden: !user.hasChangeRole(UserRoles.stock),
+                  onClick: () => editStockItem.open()
+                }),
+                {
+                  name: t`Convert`,
+                  tooltip: t`Convert this stock item to a different part`,
+                  hidden: !user.hasChangeRole(UserRoles.stock) || !canConvert,
+                  icon: <IconTransform color='blue' />,
+                  onClick: () => convertStockItem.open()
+                },
+                DeleteItemAction({
+                  hidden: !user.hasDeleteRole(UserRoles.stock),
+                  onClick: () => deleteStockItem.open()
+                })
+              ]
+        }
       />
     ];
-  }, [id, stockitem, part, user, stockAdjustActions.menuActions]);
+  }, [id, stockitem, part, user, stockAdjustActions.menuActions, restricted]);
 
   const stockBadges: ReactNode[] = useMemo(() => {
-    let available = (stockitem?.quantity ?? 0) - (stockitem?.allocated ?? 0);
-    available = Math.max(0, available);
+    const available = stockAvailableQuantity(stockitem);
+    const frozen = stockFrozenQuantity(stockitem);
 
     return instanceQuery.isLoading
       ? []
@@ -673,6 +699,12 @@ export default function StockDetail() {
               available != stockitem.quantity
             }
             key='available'
+          />,
+          <DetailsBadge
+            color='orange'
+            label={`${t`Frozen quantity`}: ${formatDecimal(frozen)}`}
+            visible={stockitem.in_stock && !stockitem.serial && frozen > 0}
+            key='scan-frozen'
           />,
           <DetailsBadge
             color='blue'
@@ -734,7 +766,9 @@ export default function StockDetail() {
             subtitle={stockitem.part_detail?.full_name}
             imageUrl={stockitem.part_detail?.thumbnail}
             editAction={editStockItem.open}
-            editEnabled={user.hasChangePermission(ModelType.stockitem)}
+            editEnabled={
+              !restricted && user.hasChangePermission(ModelType.stockitem)
+            }
             badges={stockBadges}
             breadcrumbs={
               user.hasViewRole(UserRoles.stock_location)

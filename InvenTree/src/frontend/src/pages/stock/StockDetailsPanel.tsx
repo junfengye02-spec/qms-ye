@@ -29,6 +29,10 @@ import { DetailsImage } from '../../components/details/DetailsImage';
 import { ItemDetailsGrid } from '../../components/details/ItemDetails';
 import { formatCurrency } from '../../defaults/formatters';
 import { useFindSerialNumberForm } from '../../forms/StockForms';
+import {
+  stockAvailableQuantity,
+  stockFrozenQuantity
+} from '../../functions/stock';
 import { useInstance } from '../../hooks/UseInstance';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
 
@@ -75,7 +79,7 @@ export function StockDetailsPanel({
 
   const data = useMemo(() => {
     const d = { ...instance };
-    d.available_stock = Math.max(0, (d.quantity ?? 0) - (d.allocated ?? 0));
+    d.available_stock = stockAvailableQuantity(d);
     return d;
   }, [instance]);
 
@@ -213,6 +217,14 @@ export function StockDetailsPanel({
       unit: part?.units,
       icon: 'tick_off',
       hidden: !instance?.allocated
+    },
+    {
+      type: 'number',
+      name: 'scan_frozen',
+      label: t`Frozen quantity`,
+      unit: part?.units,
+      icon: 'lock',
+      hidden: stockFrozenQuantity(instance) <= 0
     },
     {
       type: 'text',

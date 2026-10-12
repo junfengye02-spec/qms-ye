@@ -1,20 +1,20 @@
-import { t } from '@lingui/core/macro';
-import { Container, Flex, Space } from '@mantine/core';
-import {
-  Spotlight,
-  type SpotlightActionData,
-  createSpotlight
-} from '@mantine/spotlight';
-import { IconSearch } from '@tabler/icons-react';
-import { type JSX, useEffect, useMemo, useState } from 'react';
-import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
-
 import { Boundary } from '@lib/components/Boundary';
 import { identifierString } from '@lib/functions/Conversion';
 import { ApiEndpoints, apiUrl } from '@lib/index';
+import { t } from '@lingui/core/macro';
+import { Container, Flex, Space } from '@mantine/core';
+import {
+  createSpotlight,
+  Spotlight,
+  type SpotlightActionData
+} from '@mantine/spotlight';
+import { IconSearch } from '@tabler/icons-react';
 import { useQuery } from '@tanstack/react-query';
+import { type JSX, useEffect, useMemo, useState } from 'react';
+import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../../App';
 import { getActions } from '../../defaults/actions';
+import { isWmsBusinessPath, wmsAccess } from '../../functions/wms';
 import * as classes from '../../main.css';
 import {
   useGlobalSettingsState,
@@ -63,6 +63,10 @@ export default function LayoutComponent() {
   const user = useUserState();
   const userSettings = useUserSettingsState();
   const globalSettings = useGlobalSettingsState();
+  const warehouse = wmsAccess(
+    user.user,
+    globalSettings.isSet('SCAN_APPROVAL_ENABLED')
+  );
 
   const pluginsEnabled: boolean = useMemo(
     () => globalSettings.isSet('ENABLE_PLUGINS_INTERFACE'),
@@ -120,6 +124,14 @@ export default function LayoutComponent() {
     setActions([...defaultActions, ...pluginActions]);
   }, [defaultActions.length, pluginActions.length, location]);
 
+  if (
+    user.isLoggedIn() &&
+    warehouse.restricted &&
+    !isWmsBusinessPath(location.pathname)
+  ) {
+    return <Navigate replace to={warehouse.home} />;
+  }
+
   return (
     <ProtectedRoute>
       <>
@@ -133,7 +145,7 @@ export default function LayoutComponent() {
           </Container>
           <Space h='xl' />
           <Footer />
-          {userSettings.isSet('SHOW_SPOTLIGHT') && (
+          {!warehouse.restricted && userSettings.isSet('SHOW_SPOTLIGHT') && (
             <Spotlight
               actions={actions}
               store={firstStore}

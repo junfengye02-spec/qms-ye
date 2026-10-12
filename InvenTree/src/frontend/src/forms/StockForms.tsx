@@ -2154,7 +2154,8 @@ export function stockLocationFields(): ApiFormFieldSet {
     custom_icon: {
       field_type: 'icon'
     },
-    location_type: {}
+    location_type: {},
+    approval_owner: {}
   };
 
   return fields;

@@ -31,6 +31,10 @@ import {
   formatDecimal
 } from '../../defaults/formatters';
 import {
+  stockAvailableQuantity,
+  stockFrozenQuantity
+} from '../../functions/stock';
+import {
   useGlobalSettingsState,
   useUserSettingsState
 } from '../../states/SettingsStates';
@@ -159,7 +163,8 @@ export function StockColumn(props: StockColumnProps): TableColumn {
 
       const quantity = stock_item.quantity ?? 0;
       const allocated = stock_item.allocated ?? 0;
-      const available = quantity - allocated;
+      const available = stockAvailableQuantity(stock_item);
+      const frozen = stockFrozenQuantity(stock_item);
 
       const extra: ReactNode[] = [];
       let color = undefined;
@@ -173,6 +178,8 @@ export function StockColumn(props: StockColumnProps): TableColumn {
       // Override with serial number if available
       if (stock_item.serial && quantity == 1) {
         text = `# ${stock_item.serial}`;
+      } else if (available != quantity) {
+        text = `${formatDecimal(available)} / ${formatDecimal(quantity)}`;
       }
 
       if (stock_item.is_building) {
@@ -231,6 +238,15 @@ export function StockColumn(props: StockColumnProps): TableColumn {
       }
 
       if (stock_item.in_stock) {
+        if (frozen > 0) {
+          color = 'orange';
+          extra.push(
+            <Text key='scan-frozen' size='sm' c='orange'>
+              {`${t`Frozen quantity`}: ${formatDecimal(frozen)}`}
+            </Text>
+          );
+        }
+
         if (allocated > 0) {
           if (allocated > quantity) {
             color = 'red';

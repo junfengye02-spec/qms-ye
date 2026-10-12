@@ -46,8 +46,10 @@ import {
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
 import { useStockAdjustActions } from '../../hooks/UseStockAdjustActions';
-import { useUserSettingsState } from '../../states/SettingsStates';
-import { useGlobalSettingsState } from '../../states/SettingsStates';
+import {
+  useGlobalSettingsState,
+  useUserSettingsState
+} from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
 import { PartListTable } from '../../tables/part/PartTable';
 import { StockItemTable } from '../../tables/stock/StockItemTable';
@@ -153,6 +155,7 @@ export default function Stock() {
         content: (
           <StockItemTable
             tableName='location-stock'
+            nativeInventory
             allowAdd
             params={{
               location: id

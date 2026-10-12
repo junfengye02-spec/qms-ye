@@ -143,6 +143,17 @@ export enum ApiEndpoints {
 
   // Stock item API endpoints
   stock_item_list = 'stock/',
+  stock_scan_inbound = 'stock/scan-inbound/',
+  stock_scan_inbound_v2 = 'stock/scan/inbound/',
+  stock_scan_outbound = 'stock/scan/outbound/',
+  stock_scan_events = 'stock/scan/events/',
+  stock_scan_requests = 'stock/scan/requests/',
+  stock_scan_request_detail = 'stock/scan/requests/:id/',
+  stock_scan_request_lines = 'stock/scan/requests/:id/lines/:event_pk/',
+  stock_scan_request_submit = 'stock/scan/requests/:id/submit/',
+  stock_scan_request_cancel = 'stock/scan/requests/:id/cancel/',
+  stock_scan_request_approve = 'stock/scan/requests/:id/approve/',
+  stock_scan_request_reject = 'stock/scan/requests/:id/reject/',
   stock_tracking_list = 'stock/track/',
   stock_test_result_list = 'stock/test/',
   stock_transfer = 'stock/transfer/',
