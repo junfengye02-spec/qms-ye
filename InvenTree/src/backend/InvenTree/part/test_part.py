@@ -101,9 +101,10 @@ class TemplateTagTest(InvenTreeTestCase):
     def test_setting_object(self):
         """Test the 'setting_object' template tag."""
         # Normal
-        self.assertEqual(
-            inventree_extras.setting_object('PART_ALLOW_EDIT_IPN').value, True
-        )
+        setting = inventree_extras.setting_object('PART_ALLOW_EDIT_IPN')
+        self.assertEqual(setting.key, 'PART_ALLOW_EDIT_IPN')
+        # Persisted values are strings; use the setting's typed accessor.
+        self.assertIs(setting.as_bool(), True)
 
         # User
         self.assertEqual(
@@ -124,19 +125,15 @@ class TemplateTagTest(InvenTreeTestCase):
     def test_settings_value(self):
         """Test the 'settings_value' template tag."""
         # Normal
-        self.assertEqual(
-            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN'), True
-        )
+        self.assertEqual(inventree_extras.settings_value('PART_ALLOW_EDIT_IPN'), True)
 
         # User
         self.assertEqual(
-            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN', user=self.user),
-            '',
+            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN', user=self.user), ''
         )
         self.logout()
         self.assertEqual(
-            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN', user=self.user),
-            '',
+            inventree_extras.settings_value('PART_ALLOW_EDIT_IPN', user=self.user), ''
         )
 
 
