@@ -120,3 +120,4 @@ InvenTree/web/static
 # test results and logs
 _tests*.txt
 .codspeed/
+.gstack/
