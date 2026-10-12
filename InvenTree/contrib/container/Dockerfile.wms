@@ -1,0 +1,17 @@
+ARG INVENTREE_BASE_IMAGE=inventree/inventree@sha256:a8818fe8083deea297c2ef84e578bb8dad98d9dca7ac56da3076ca4f84221da2
+FROM ${INVENTREE_BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="WMS Ye InvenTree" \
+      org.opencontainers.image.description="InvenTree 1.5.1 with scan approval and IPN label customizations" \
+      org.opencontainers.image.version="1.5.1-wmsye"
+
+# The base image already contains the exact InvenTree 1.5.1 runtime and pinned
+# Python dependencies. Replace its application tree with our tested stable-branch
+# fork, including the production frontend bundle generated before this build.
+COPY src/backend/InvenTree /home/inventree/src/backend/InvenTree
+
+# A clean checkout must build the custom frontend before the image is created.
+# Fail loudly instead of silently shipping the base image's stock frontend.
+RUN test -f /home/inventree/src/backend/InvenTree/web/static/web/.vite/manifest.json \
+    && grep -q 'src/pages/stock/ScanStockPage.tsx' \
+      /home/inventree/src/backend/InvenTree/web/static/web/.vite/manifest.json
