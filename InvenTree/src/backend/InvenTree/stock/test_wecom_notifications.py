@@ -50,6 +50,23 @@ class WeComNotificationTest(SimpleTestCase):
         self.assertFalse(notifications._post_markdown('test'))
         post.assert_not_called()
 
+    @mock.patch.dict(os.environ, {notifications.WECOM_WEBHOOK_ENV: webhook})
+    @mock.patch('stock.notifications.logger')
+    @mock.patch('stock.notifications.requests.post')
+    def test_network_failure_does_not_log_webhook_secret(self, post, logger):
+        """Request exceptions can contain the URL, which must stay out of logs."""
+        post.side_effect = notifications.requests.ConnectionError(
+            f'Failed to connect to {self.webhook}'
+        )
+
+        self.assertFalse(notifications._post_markdown('test'))
+
+        logger.warning.assert_called_once_with(
+            'Enterprise WeChat robot notification failed',
+            error_type='ConnectionError',
+        )
+        self.assertNotIn(self.webhook, str(logger.mock_calls))
+
     def test_direct_inbound_message_escapes_scanned_mentions(self):
         """Barcode text cannot inject a group mention or a new Markdown line."""
         event = SimpleNamespace(

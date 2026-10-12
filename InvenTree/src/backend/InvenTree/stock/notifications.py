@@ -219,7 +219,10 @@ def _post_markdown(content: str, *, mention: bool = False) -> bool:
         )
         data = response.json()
     except (requests.RequestException, ValueError) as exc:
-        logger.warning('Enterprise WeChat robot notification failed', error=str(exc))
+        logger.warning(
+            'Enterprise WeChat robot notification failed',
+            error_type=type(exc).__name__,
+        )
         return False
     if not response.ok or data.get('errcode') != 0:
         logger.warning(
