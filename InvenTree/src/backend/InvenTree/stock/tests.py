@@ -17,11 +17,11 @@ from djmoney.money import Money
 from rest_framework.test import APIClient
 
 from build.models import Build
-from common.models import InvenTreeSetting
+from common.models import InvenTreeSetting, ProjectCode
 from company.models import Company
 from InvenTree.unit_test import AdminTestCase, InvenTreeTestCase
 from order.models import SalesOrder
-from part.models import Part, PartTestTemplate
+from part.models import Part, PartCategory, PartTestTemplate
 from plugin.base.event.events import batch_events
 from stock.events import StockEvents
 from stock.status_codes import StockHistoryCode, StockStatus
@@ -1986,10 +1986,14 @@ class ScanInboundConcurrencyTest(TransactionTestCase):
         super().setUp()
         self.user = get_user_model().objects.get(username='sue_the_superuser')
         self.location = StockLocation.objects.create(name='Scan concurrency shelf')
+        self.project = ProjectCode.objects.create(code='SCAN-CONCURRENCY')
+        self.category = PartCategory.objects.create(name='Scan concurrency category')
         self.part = Part.objects.create(
             name='Scan concurrency part',
             description='Part for concurrent scan inbound requests',
             IPN='SCAN-CONCURRENCY-001',
+            category=self.category,
+            units='pcs',
             default_location=self.location,
         )
 
@@ -2014,6 +2018,7 @@ class ScanInboundConcurrencyTest(TransactionTestCase):
                         'barcode': self.part.IPN,
                         'client_event_id': str(uuid.uuid4()),
                         'destination_location': self.location.pk,
+                        'project_id': self.project.pk,
                     },
                     format='json',
                 )
@@ -2082,6 +2087,7 @@ class ScanInboundConcurrencyTest(TransactionTestCase):
                         'barcode': self.part.IPN,
                         'client_event_id': client_event_id,
                         'destination_location': self.location.pk,
+                        'project_id': self.project.pk,
                     },
                     format='json',
                 )
@@ -2139,8 +2145,11 @@ class ScanInboundConcurrencyTest(TransactionTestCase):
                         'barcode': barcode,
                         'client_event_id': str(uuid.uuid4()),
                         'destination_location': self.location.pk,
+                        'project_id': self.project.pk,
                         'create_part': {
                             'name': 'Concurrent newly scanned part',
+                            'category': self.category.pk,
+                            'units': 'pcs',
                             'default_location': self.location.pk,
                         },
                     },
@@ -2200,8 +2209,11 @@ class ScanInboundConcurrencyTest(TransactionTestCase):
                         'barcode': barcode,
                         'client_event_id': str(uuid.uuid4()),
                         'destination_location': self.location.pk,
+                        'project_id': self.project.pk,
                         'create_part': {
                             'name': f'Conflicting scanned part {index}',
+                            'category': self.category.pk,
+                            'units': 'pcs',
                             'default_location': self.location.pk,
                         },
                     },
