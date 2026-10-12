@@ -62,8 +62,7 @@ class WeComNotificationTest(SimpleTestCase):
         self.assertFalse(notifications._post_markdown('test'))
 
         logger.warning.assert_called_once_with(
-            'Enterprise WeChat robot notification failed',
-            error_type='ConnectionError',
+            'Enterprise WeChat robot notification failed', error_type='ConnectionError'
         )
         self.assertNotIn(self.webhook, str(logger.mock_calls))
 
