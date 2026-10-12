@@ -1,0 +1,49 @@
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+secret_key.txt
+config.yaml
+local_settings.py
+
+# Runtime data and database backups
+inventree-data/
+backups/
+*.dump
+*.psql.bin*
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+
+# Dependencies, compiled output and tool caches
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.cache/
+.gstack/
+.DS_Store
+*.log
+coverage/
+htmlcov/
+.coverage
+
+# Local previews, generated reports and presentation workspaces
+.ppt*-build/
+.codex-preview.*
+output/
+outputs/
+tmp/
+test-results/
+playwright-report/
+blob-report/
+
+# Machine-specific trust packages: provision per deployment
+/inventree-deploy/certificates/
+/inventree-deploy/inventree-local-ca.crt
+/inventree-deploy/*.docx
