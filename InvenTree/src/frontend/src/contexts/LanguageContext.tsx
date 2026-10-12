@@ -1,9 +1,8 @@
+import { useStoredTableState } from '@lib/states/StoredTableState';
 import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { LoadingOverlay, Text } from '@mantine/core';
 import { type JSX, useEffect, useRef, useState } from 'react';
-
-import { useStoredTableState } from '@lib/states/StoredTableState';
 import { useShallow } from 'zustand/react/shallow';
 import { api } from '../App';
 import { markLocaleReady } from '../functions/localeReady';
@@ -193,7 +192,13 @@ export async function activateLocale(locale: string | null) {
     locale = getPriorityLocale();
   }
 
-  const localeDir = locale.split('-')[0]; // Extract the base locale (e.g., 'en' from 'en-US')
+  const normalizedLocale = locale.replace('-', '_').toLowerCase();
+  const localeDir =
+    normalizedLocale === 'zh_hans' || normalizedLocale === 'zh_cn'
+      ? 'zh_Hans'
+      : normalizedLocale === 'zh_hant' || normalizedLocale === 'zh_tw'
+        ? 'zh_Hant'
+        : locale.split('-')[0];
 
   try {
     const { messages } = await import(`../locales/${localeDir}/messages.ts`);
