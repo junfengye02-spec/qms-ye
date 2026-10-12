@@ -1,0 +1,56 @@
+/*
+ * Enumeration of available API model types
+ */
+export enum ModelType {
+  part = 'part',
+  supplierpart = 'supplierpart',
+  manufacturerpart = 'manufacturerpart',
+  partcategory = 'partcategory',
+  parttesttemplate = 'parttesttemplate',
+  projectcode = 'projectcode',
+  stockitem = 'stockitem',
+  stocklocation = 'stocklocation',
+  stocklocationtype = 'stocklocationtype',
+  stockhistory = 'stockhistory',
+  build = 'build',
+  buildline = 'buildline',
+  builditem = 'builditem',
+  company = 'company',
+  parameter = 'parameter',
+  parametertemplate = 'parametertemplate',
+  purchaseorder = 'purchaseorder',
+  purchaseorderlineitem = 'purchaseorderlineitem',
+  salesorder = 'salesorder',
+  salesordershipment = 'salesordershipment',
+  returnorder = 'returnorder',
+  returnorderlineitem = 'returnorderlineitem',
+  transferorder = 'transferorder',
+  transferorderlineitem = 'transferorderlineitem',
+  importsession = 'importsession',
+  address = 'address',
+  contact = 'contact',
+  owner = 'owner',
+  user = 'user',
+  group = 'group',
+  reporttemplate = 'reporttemplate',
+  labeltemplate = 'labeltemplate',
+  pluginconfig = 'pluginconfig',
+  contenttype = 'contenttype',
+  selectionlist = 'selectionlist',
+  selectionentry = 'selectionentry',
+  error = 'error',
+  tag = 'tag'
+}
+
+export enum PluginPanelKey {
+  // settings / admin
+  admincenter = 'admincenter',
+  systemsettings = 'systemsettings',
+  usersettings = 'usersettings',
+  // generic
+  core = 'core',
+  // landing pages
+  purchasing = 'purchasing',
+  sales = 'sales',
+  manufacturing = 'manufacturing'
+}

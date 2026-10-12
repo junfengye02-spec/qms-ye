@@ -1,0 +1,423 @@
+"""Provides helper functions used throughout the InvenTree project that access the database."""
+
+import contextlib
+import contextvars
+import io
+import ipaddress
+import socket
+from typing import Optional, cast
+from urllib.parse import urljoin, urlparse
+
+from django.conf import settings
+from django.core.validators import URLValidator
+from django.db.utils import OperationalError, ProgrammingError
+from django.utils.translation import gettext_lazy as _
+
+import requests
+import requests.exceptions
+import structlog
+from PIL import Image
+
+from common.notifications import (
+    InvenTreeNotificationBodies,
+    NotificationBody,
+    trigger_notification,
+)
+from common.settings import get_global_setting
+from InvenTree.cache import (
+    get_cached_content_types,
+    get_session_cache,
+    set_session_cache,
+)
+from InvenTree.ready import ignore_ready_warning
+
+logger = structlog.get_logger('inventree')
+
+
+def get_base_url(request=None) -> str:
+    """Return the base URL for the InvenTree server.
+
+    The base URL is determined in the following order of decreasing priority:
+
+    1. If a request object is provided, use the request URL
+    2. Multi-site is enabled, and the current site has a valid URL
+    3. If settings.SITE_URL is set (e.g. in the Django settings), use that
+    4. If the InvenTree setting INVENTREE_BASE_URL is set, use that
+    """
+    # Check if a request is provided
+    if request:
+        return request.build_absolute_uri('/')
+
+    # Check if multi-site is enabled
+    try:
+        from django.contrib.sites.models import Site
+
+        return Site.objects.get_current().domain
+    except (ImportError, RuntimeError):
+        pass
+
+    # Check if a global site URL is provided
+    if site_url := getattr(settings, 'SITE_URL', None):
+        return site_url
+
+    # Check if a global InvenTree setting is provided
+    try:
+        if site_url := get_global_setting('INVENTREE_BASE_URL', create=False):
+            return cast(str, site_url)
+    except (ProgrammingError, OperationalError):
+        pass
+
+    # No base URL available
+    return ''
+
+
+def construct_absolute_url(*arg, base_url=None, request=None):
+    """Construct (or attempt to construct) an absolute URL from a relative URL.
+
+    Args:
+        *arg: The relative URL to construct
+        base_url: The base URL to use for the construction (if not provided, will attempt to determine from settings)
+        request: The request object to use for the construction (optional)
+    """
+    relative_url = '/'.join(arg)
+
+    if not base_url:
+        base_url = get_base_url(request=request)
+
+    return urljoin(base_url, relative_url)
+
+
+_ssrf_guard_active = contextvars.ContextVar('ssrf_guard_active', default=False)
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _is_unsafe_ip(host: str) -> bool:
+    """Return True if the given (already-resolved) address string is private/reserved."""
+    ip = ipaddress.ip_address(host)
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+
+
+def _guarded_getaddrinfo(host, *args, **kwargs):
+    """Drop-in replacement for socket.getaddrinfo which enforces SSRF checks while active.
+
+    DNS resolution is otherwise delegated to the OS resolver on every connection
+    attempt an HTTP client makes - including ones made well after an earlier,
+    now-discarded resolution was validated by `validate_url_no_ssrf()`. An attacker
+    controlling authoritative DNS for their own domain can answer a first ("check")
+    lookup with a public IP and a later ("use") lookup with a private/internal one
+    (DNS rebinding), bypassing a validation step that only inspects the first answer.
+
+    Patching this at the socket layer means the *actual* resolution used to open the
+    real connection - whichever call that turns out to be - is the one that gets
+    checked, so there is no window between "validated" and "connected" for the
+    answer to change. The guard is only enforced while `ssrf_safe_context()` is
+    active in the current context, so unrelated resolutions (e.g. other threads
+    talking to the database/cache) are never affected.
+    """
+    result = _real_getaddrinfo(host, *args, **kwargs)
+
+    if _ssrf_guard_active.get():
+        for _family, _type, _proto, _canonname, sockaddr in result:
+            if _is_unsafe_ip(sockaddr[0]):
+                raise socket.gaierror(
+                    f'Host {host!r} resolved to a private or reserved address'
+                )
+
+    return result
+
+
+socket.getaddrinfo = _guarded_getaddrinfo
+
+
+@contextlib.contextmanager
+def ssrf_safe_context():
+    """Enforce SSRF IP validation on every DNS resolution performed within this block.
+
+    Wrap any code which resolves a user/attacker-influenced hostname and then
+    connects to it (e.g. `requests.get()`, or a library like WeasyPrint doing its
+    own resolution internally) in this context manager so that the resolution
+    backing the *actual* connection is validated, not just an earlier, separate
+    lookup whose result is discarded. See `_guarded_getaddrinfo` for why this
+    closes the DNS-rebinding TOCTOU gap that a standalone pre-check cannot.
+    """
+    token = _ssrf_guard_active.set(True)
+    try:
+        yield
+    finally:
+        _ssrf_guard_active.reset(token)
+
+
+def validate_url_no_ssrf(url):
+    """Validate that a URL does not point to a private/internal network address.
+
+    Resolves the hostname to an IP address and checks it against private,
+    loopback, link-local, and reserved IP ranges to prevent SSRF attacks.
+
+    Arguments:
+        url: The URL to validate
+
+    Raises:
+        ValueError: If the URL resolves to a private or reserved IP address
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        raise ValueError(_('Invalid URL: no hostname'))
+
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        raise ValueError(_('Invalid URL: hostname could not be resolved'))
+
+    for _family, _type, _proto, _canonname, sockaddr in addrinfo:
+        if _is_unsafe_ip(sockaddr[0]):
+            raise ValueError(_('URL points to a private or reserved IP address'))
+
+
+def download_image_from_url(
+    remote_url: str,
+    timeout: float = 2.5,
+    user_agent: str = '',
+    max_size: Optional[int] = None,
+):
+    """Download an image file from a remote URL.
+
+    This is a potentially dangerous operation, so we must perform some checks:
+    - The remote URL is available
+    - The Content-Length is provided, and is not too large
+    - The file is a valid image file
+
+    Arguments:
+        remote_url: The remote URL to retrieve image
+        timeout: Connection timeout in seconds (default = 5)
+        user_agent: User-Agent string to use for the request (optional)
+        max_size: Maximum allowed image size (in bytes) (default = 1MB)
+
+    Returns:
+        An in-memory PIL image file, if the download was successful
+
+    Raises:
+        requests.exceptions.ConnectionError: Connection could not be established
+        requests.exceptions.Timeout: Connection timed out
+        requests.exceptions.HTTPError: Server responded with invalid response code
+        ValueError: Server responded with invalid 'Content-Length' value
+        TypeError: Response is not a valid image
+    """
+    # Check that the provided URL at least looks valid
+    validator = URLValidator()
+    validator(remote_url)
+
+    # SSRF protection: validate the resolved IP is not private/internal
+    validate_url_no_ssrf(remote_url)
+
+    # Calculate maximum allowable image size (in bytes)
+    max_size = max_size or 1 * 1024 * 1024  # Default to 1MB if not provided
+
+    # Add user specified user-agent to request (if specified)
+    headers = {'User-Agent': user_agent} if user_agent else None
+
+    try:
+        # SSRF protection: guard every DNS resolution made while actually connecting
+        # (not just the pre-check above) so a hostname cannot pass validation with
+        # one IP and then be connected to via a different, private one (DNS rebinding).
+        with ssrf_safe_context():
+            response = requests.get(
+                remote_url,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+                headers=headers,
+            )
+
+            # Handle redirects manually to validate each destination
+            max_redirects = 5
+            redirect_count = 0
+
+            while response.is_redirect and redirect_count < max_redirects:
+                redirect_url = response.headers.get('Location')
+                if not redirect_url:
+                    break
+
+                # Validate the redirect destination against SSRF
+                validator(redirect_url)
+                validate_url_no_ssrf(redirect_url)
+
+                redirect_count += 1
+                response = requests.get(
+                    redirect_url,
+                    timeout=timeout,
+                    allow_redirects=False,
+                    stream=True,
+                    headers=headers,
+                )
+
+        if redirect_count >= max_redirects:
+            raise ValueError(_('Too many redirects'))
+
+        # Throw an error if anything goes wrong
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError as exc:
+        raise Exception(_('Connection error') + f': {exc!s}')
+    except requests.exceptions.Timeout as exc:
+        raise exc
+    except requests.exceptions.HTTPError:
+        raise requests.exceptions.HTTPError(
+            _('Server responded with invalid status code') + f': {response.status_code}'
+        )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise Exception(_('Exception occurred') + f': {exc!s}')
+
+    if response.status_code != 200:
+        raise Exception(
+            _('Server responded with invalid status code') + f': {response.status_code}'
+        )
+
+    try:
+        content_length = int(response.headers.get('Content-Length', 0))
+    except ValueError:
+        raise ValueError(_('Server responded with invalid Content-Length value'))
+
+    if content_length > max_size:
+        raise ValueError(_('Image size is too large'))
+
+    # Download the file, ensuring we do not exceed the reported size
+    file = io.BytesIO()
+
+    dl_size = 0
+    chunk_size = 64 * 1024
+
+    for chunk in response.iter_content(chunk_size=chunk_size):
+        dl_size += len(chunk)
+
+        if dl_size > max_size:
+            raise ValueError(_('Image download exceeded maximum size'))
+
+        file.write(chunk)
+
+    if dl_size == 0:
+        raise ValueError(_('Remote server returned empty response'))
+
+    # Now, attempt to convert the downloaded data to a valid image file
+    # img.verify() will throw an exception if the image is not valid
+    try:
+        img = Image.open(file).convert()
+        img.verify()
+    except Exception:
+        raise TypeError(_('Supplied URL is not a valid image file'))
+
+    return img
+
+
+@ignore_ready_warning
+def getModelsWithMixin(mixin_class) -> list:
+    """Return a list of database models that inherit from the given mixin class.
+
+    Args:
+        mixin_class: The mixin class to search for
+    Returns:
+        List of models that inherit from the given mixin class
+    """
+    # First, look in the session cache - to prevent repeated expensive comparisons
+    cache_key = f'models_with_mixin_{mixin_class.__name__}'
+
+    if cached_models := get_session_cache(cache_key):
+        return cached_models
+
+    content_types = get_cached_content_types()
+
+    db_models = [x.model_class() for x in content_types if x is not None]
+
+    models_with_mixin = [
+        x for x in db_models if x is not None and issubclass(x, mixin_class)
+    ]
+    # sort to make resulting list deterministic (and easier to test)
+    models_with_mixin.sort(key=lambda x: x._meta.label_lower)
+
+    # Store the result in the session cache
+    set_session_cache(cache_key, models_with_mixin)
+    return models_with_mixin
+
+
+def notify_responsible(
+    instance,
+    sender,
+    content: NotificationBody = InvenTreeNotificationBodies.NewOrder,
+    exclude=None,
+    extra_users: Optional[list] = None,
+):
+    """Notify all responsible parties of a change in an instance.
+
+    Parses the supplied content with the provided instance and sender and sends a notification to all responsible users,
+    excluding the optional excluded list.
+
+    Args:
+        instance: The newly created instance
+        sender: Sender model reference
+        content (NotificationBody, optional): _description_. Defaults to InvenTreeNotificationBodies.NewOrder.
+        exclude (User, optional): User instance that should be excluded. Defaults to None.
+        extra_users (list, optional): List of extra users to notify. Defaults to None.
+    """
+    import InvenTree.ready
+
+    if InvenTree.ready.isImportingData() or InvenTree.ready.isRunningMigrations():
+        return
+
+    users = [instance.responsible]
+
+    if extra_users:
+        users.extend(extra_users)
+
+    notify_users(users, instance, sender, content=content, exclude=exclude)
+
+
+def notify_users(
+    users,
+    instance,
+    sender,
+    content: NotificationBody = InvenTreeNotificationBodies.NewOrder,
+    exclude=None,
+):
+    """Notify all passed users or groups.
+
+    Parses the supplied content with the provided instance and sender and sends a notification to all users,
+    excluding the optional excluded list.
+
+    Args:
+        users: List of users or groups to notify
+        instance: The newly created instance
+        sender: Sender model reference
+        content (NotificationBody, optional): _description_. Defaults to InvenTreeNotificationBodies.NewOrder.
+        exclude (User, optional): User instance that should be excluded. Defaults to None.
+    """
+    # Setup context for notification parsing
+    content_context = {
+        'instance': str(instance),
+        'verbose_name': sender._meta.verbose_name,
+        'app_label': sender._meta.app_label,
+        'model_name': sender._meta.model_name,
+    }
+
+    # Setup notification context
+    context = {
+        'instance': instance,
+        'name': content.name.format(**content_context),
+        'message': content.message.format(**content_context),
+        'link': construct_absolute_url(instance.get_absolute_url()),
+        'template': {'subject': content.name.format(**content_context)},
+    }
+
+    tmp = content.template
+    if tmp:
+        context['template']['html'] = tmp.format(**content_context)
+
+    # Create notification
+    trigger_notification(
+        instance,
+        content.slug.format(**content_context),
+        targets=users,
+        target_exclude=[exclude],
+        context=context,
+    )

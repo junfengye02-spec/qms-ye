@@ -1,0 +1,878 @@
+import { t } from '@lingui/core/macro';
+import {
+  ActionIcon,
+  Alert,
+  Center,
+  Group,
+  Loader,
+  Paper,
+  Skeleton,
+  Stack,
+  Text
+} from '@mantine/core';
+import { notifications } from '@mantine/notifications';
+import {
+  IconBookmarks,
+  IconBuilding,
+  IconChecklist,
+  IconClipboardList,
+  IconCurrencyDollar,
+  IconExclamationCircle,
+  IconInfoCircle,
+  IconLayersLinked,
+  IconListDetails,
+  IconListTree,
+  IconLock,
+  IconLockOpen,
+  IconPackages,
+  IconSearch,
+  IconShoppingCart,
+  IconStack2,
+  IconTestPipe,
+  IconTools,
+  IconTransfer,
+  IconTruckDelivery,
+  IconTruckReturn,
+  IconVersions
+} from '@tabler/icons-react';
+import { useQuery } from '@tanstack/react-query';
+import { type ReactNode, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import Select from 'react-select';
+
+import { ApiEndpoints } from '@lib/enums/ApiEndpoints';
+import { ModelType } from '@lib/enums/ModelType';
+import { UserRoles } from '@lib/enums/Roles';
+import { apiUrl } from '@lib/functions/Api';
+import { getDetailUrl } from '@lib/functions/Navigation';
+import type { StockOperationProps } from '@lib/types/Forms';
+import type { PanelType } from '@lib/types/Panel';
+import AdminButton from '../../components/buttons/AdminButton';
+import { PrintingActions } from '../../components/buttons/PrintingActions';
+import StarredToggleButton from '../../components/buttons/StarredToggleButton';
+import DetailsBadge from '../../components/details/DetailsBadge';
+import { Thumbnail } from '../../components/images/Thumbnail';
+import {
+  ActionDropdown,
+  BarcodeActionDropdown,
+  DeleteItemAction,
+  DuplicateItemAction,
+  EditItemAction,
+  OptionsActionDropdown
+} from '../../components/items/ActionDropdown';
+import InstanceDetail from '../../components/nav/InstanceDetail';
+import NavigationTree from '../../components/nav/NavigationTree';
+import { PageDetail } from '../../components/nav/PageDetail';
+import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import NotesPanel from '../../components/panels/NotesPanel';
+import { PanelGroup } from '../../components/panels/PanelGroup';
+import { RenderPart } from '../../components/render/Part';
+import OrderPartsWizard from '../../components/wizards/OrderPartsWizard';
+import { useApi } from '../../contexts/ApiContext';
+import { formatDecimal } from '../../defaults/formatters';
+import { usePartFields } from '../../forms/PartForms';
+import { useFindSerialNumberForm } from '../../forms/StockForms';
+import {
+  useCreateApiFormModal,
+  useDeleteApiFormModal,
+  useEditApiFormModal
+} from '../../hooks/UseForm';
+import { useInstance } from '../../hooks/UseInstance';
+import { useStockAdjustActions } from '../../hooks/UseStockAdjustActions';
+import {
+  useGlobalSettingsState,
+  useUserSettingsState
+} from '../../states/SettingsStates';
+import { useUserState } from '../../states/UserState';
+import { BomTable } from '../../tables/bom/BomTable';
+import { UsedInTable } from '../../tables/bom/UsedInTable';
+import { BuildOrderTable } from '../../tables/build/BuildOrderTable';
+import { ParameterTable } from '../../tables/general/ParameterTable';
+import PartPurchaseOrdersTable from '../../tables/part/PartPurchaseOrdersTable';
+import PartSalesOrdersTable from '../../tables/part/PartSalesOrdersTable';
+import PartTestResultTable from '../../tables/part/PartTestResultTable';
+import PartTestTemplateTable from '../../tables/part/PartTestTemplateTable';
+import { PartVariantTable } from '../../tables/part/PartVariantTable';
+import { RelatedPartTable } from '../../tables/part/RelatedPartTable';
+import { ReturnOrderTable } from '../../tables/sales/ReturnOrderTable';
+import { StockItemTable } from '../../tables/stock/StockItemTable';
+import { TransferOrderTable } from '../../tables/stock/TransferOrderTable';
+import PartAllocationPanel from './PartAllocationPanel';
+import { PartDetailsPanel } from './PartDetailsPanel';
+import PartPricingPanel from './PartPricingPanel';
+import PartStockHistoryDetail from './PartStockHistoryDetail';
+import PartSupplierDetail from './PartSupplierDetail';
+import { BomActions } from './bom/BomActions';
+
+/**
+ * Render a part revision selector component
+ */
+function RevisionSelector({
+  part,
+  options
+}: {
+  part: any;
+  options: any[];
+}) {
+  const navigate = useNavigate();
+
+  return (
+    <Select
+      id='part-revision-select'
+      aria-label='part-revision-select'
+      options={options}
+      value={{
+        value: part.pk,
+        label: part.full_name,
+        part: part
+      }}
+      isSearchable={false}
+      formatOptionLabel={(option: any) =>
+        RenderPart({
+          instance: option.part,
+          showSecondary: false
+        })
+      }
+      onChange={(value: any) => {
+        navigate(getDetailUrl(ModelType.part, value.value));
+      }}
+      styles={{
+        menuPortal: (base: any) => ({ ...base, zIndex: 9999 }),
+        menu: (base: any) => ({ ...base, zIndex: 9999 }),
+        menuList: (base: any) => ({ ...base, zIndex: 9999 })
+      }}
+    />
+  );
+}
+
+/**
+ * Detail view for a single Part instance
+ */
+export default function PartDetail() {
+  const { id } = useParams();
+
+  const api = useApi();
+  const navigate = useNavigate();
+  const user = useUserState();
+
+  const [treeOpen, setTreeOpen] = useState(false);
+
+  const globalSettings = useGlobalSettingsState();
+  const userSettings = useUserSettingsState();
+
+  // BOM validation information (used for hover-over info on the BOM tab)
+  const bomInformation = useInstance({
+    endpoint: ApiEndpoints.bom_validate,
+    pk: id,
+    hasPrimaryKey: true,
+    refetchOnMount: true
+  });
+
+  const {
+    instance: part,
+    refreshInstance,
+    instanceQuery
+  } = useInstance({
+    endpoint: ApiEndpoints.part_list,
+    pk: id,
+    params: {
+      path_detail: true,
+      tags: true
+    },
+    refetchOnMount: true
+  });
+
+  const { instance: partRequirements, instanceQuery: partRequirementsQuery } =
+    useInstance({
+      endpoint: ApiEndpoints.part_requirements,
+      pk: id,
+      hasPrimaryKey: true,
+      refetchOnMount: true
+    });
+
+  const lockingEnabled = useMemo(
+    () => globalSettings.isSet('PART_ENABLE_LOCKING'),
+    [globalSettings]
+  );
+
+  const revisionsEnabled = useMemo(
+    () => globalSettings.isSet('PART_ENABLE_REVISION'),
+    [globalSettings]
+  );
+
+  // Fetch information on parts which are revisions of *this* part
+  const partRevisionQuery = useQuery({
+    refetchOnMount: true,
+    enabled:
+      revisionsEnabled &&
+      !!part &&
+      (!!part.revision_count || !!part.revision_of),
+    queryKey: ['part_revisions', part.pk, part.revision_count],
+    queryFn: async () =>
+      api
+        .get(apiUrl(ApiEndpoints.part_list), {
+          params: {
+            revision_of: part.pk
+          }
+        })
+        .then(async (response) => {
+          let data = response.data;
+
+          // If the part is also a revision, fetch upstream revision information too
+          if (!!part.revision_of) {
+            await api
+              .get(apiUrl(ApiEndpoints.part_list), {
+                params: {
+                  revision_of: part.revision_of
+                }
+              })
+              .then((response) => {
+                data = [...data, ...response.data];
+              });
+          }
+          return data;
+        })
+  });
+
+  const partRevisionOptions: any[] = useMemo(() => {
+    if (partRevisionQuery.isFetching || !partRevisionQuery.data) {
+      return [];
+    }
+
+    if (!part.revision_of && !part.revision_count) {
+      return [];
+    }
+
+    const options: any[] = partRevisionQuery.data.map((revision: any) => {
+      return {
+        value: revision.pk,
+        label: revision.full_name,
+        part: revision
+      };
+    });
+
+    return options.sort((a, b) => {
+      return `${a.part.revision}`.localeCompare(b.part.revision);
+    });
+  }, [part, partRevisionQuery.isFetching, partRevisionQuery.data]);
+
+  const enableRevisionSelection: boolean = useMemo(() => {
+    return partRevisionOptions.length > 0 && revisionsEnabled;
+  }, [partRevisionOptions, revisionsEnabled]);
+
+  const revisionSelector = useMemo(() => {
+    if (!enableRevisionSelection) return null;
+    return (
+      <Paper p='sm' withBorder>
+        <Stack gap='xs'>
+          <Group gap='xs'>
+            <ActionIcon variant='transparent'>
+              <IconVersions />
+            </ActionIcon>
+            <Text>{t`Select Part Revision`}</Text>
+          </Group>
+          <RevisionSelector part={part} options={partRevisionOptions} />
+        </Stack>
+      </Paper>
+    );
+  }, [enableRevisionSelection, part, partRevisionOptions]);
+
+  // Part data panels (recalculate when part data changes)
+  const partPanels: PanelType[] = useMemo(() => {
+    return [
+      {
+        name: 'details',
+        label: t`Part Details`,
+        icon: <IconInfoCircle />,
+        content: (
+          <PartDetailsPanel
+            instance={part}
+            allowImageEdit
+            refreshInstance={refreshInstance}
+            additionalContent={revisionSelector}
+          />
+        )
+      },
+      {
+        name: 'stock',
+        label: t`Stock`,
+        icon: <IconPackages />,
+        hidden: part.virtual || !user.hasViewRole(UserRoles.stock),
+        content: part.pk ? (
+          <StockItemTable
+            tableName='part-stock'
+            allowAdd
+            params={{
+              part: part.pk
+            }}
+          />
+        ) : (
+          <Center>
+            <Loader />
+          </Center>
+        )
+      },
+      {
+        name: 'variants',
+        label: t`Variants`,
+        icon: <IconVersions />,
+        hidden: !part.is_template,
+        content: <PartVariantTable part={part} />
+      },
+      {
+        name: 'allocations',
+        label: t`Allocations`,
+        icon: <IconBookmarks />,
+        hidden: (!part.component && !part.salable) || part.virtual,
+        content: part.pk ? <PartAllocationPanel part={part} /> : <Skeleton />
+      },
+      {
+        name: 'bom',
+        label: t`Bill of Materials`,
+        controls: (
+          <BomActions bomInformation={bomInformation} partInstance={part} />
+        ),
+        icon: <IconListTree />,
+        hidden: !part.assembly || !user.hasViewRole(UserRoles.bom),
+        content: part?.pk ? (
+          <Stack gap='xs'>
+            {bomInformation.isLoaded &&
+              bomInformation.instance?.bom_validated === false && (
+                <Alert
+                  color='yellow'
+                  icon={<IconExclamationCircle />}
+                  title={t`BOM Not Validated`}
+                >
+                  <Text>{t`The Bill of Materials for this assembly has not been validated.`}</Text>
+                </Alert>
+              )}
+            <BomTable
+              partId={part.pk ?? -1}
+              partLocked={part?.locked == true}
+            />
+          </Stack>
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'used_in',
+        label: t`Used In`,
+        icon: <IconStack2 />,
+        hidden: !part.component,
+        content: <UsedInTable partId={part.pk ?? -1} />
+      },
+      {
+        name: 'pricing',
+        label: t`Part Pricing`,
+        icon: <IconCurrencyDollar />,
+        content: part ? <PartPricingPanel part={part} /> : <Skeleton />
+      },
+      {
+        name: 'suppliers',
+        label: t`Suppliers`,
+        icon: <IconBuilding />,
+        hidden:
+          !part.purchaseable || !user.hasViewRole(UserRoles.purchase_order),
+
+        content: part.pk ? (
+          <PartSupplierDetail partId={part.pk} />
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'purchase_orders',
+        label: t`Purchase Orders`,
+        icon: <IconShoppingCart />,
+        hidden:
+          !part.purchaseable || !user.hasViewRole(UserRoles.purchase_order),
+        content: part.pk ? (
+          <PartPurchaseOrdersTable partId={part.pk} />
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'sales_orders',
+        label: t`Sales Orders`,
+        icon: <IconTruckDelivery />,
+        hidden: !part.salable || !user.hasViewRole(UserRoles.sales_order),
+        content: part.pk ? (
+          <PartSalesOrdersTable partId={part.pk} />
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'return_orders',
+        label: t`Return Orders`,
+        icon: <IconTruckReturn />,
+        hidden:
+          !part.salable ||
+          !user.hasViewRole(UserRoles.return_order) ||
+          !globalSettings.isSet('RETURNORDER_ENABLED'),
+        content: part.pk ? <ReturnOrderTable partId={part.pk} /> : <Skeleton />
+      },
+      {
+        name: 'builds',
+        label: t`Build Orders`,
+        icon: <IconTools />,
+        hidden: !part.assembly || !user.hasViewRole(UserRoles.build),
+        content: part.pk ? <BuildOrderTable partId={part.pk} /> : <Skeleton />
+      },
+      {
+        name: 'transfer_orders',
+        label: t`Transfer Orders`,
+        icon: <IconTransfer />,
+        hidden:
+          part.virtual ||
+          !globalSettings.isSet('TRANSFERORDER_ENABLED') ||
+          !user.hasViewRole(UserRoles.transfer_order),
+        content: part.pk ? (
+          <TransferOrderTable partId={part.pk} />
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'stocktake',
+        label: t`Stock History`,
+        icon: <IconClipboardList />,
+        content: part ? (
+          <PartStockHistoryDetail partId={part.pk} />
+        ) : (
+          <Skeleton />
+        ),
+        hidden:
+          part.virtual ||
+          !user.hasViewRole(UserRoles.stock) ||
+          !globalSettings.isSet('STOCKTAKE_ENABLE') ||
+          !userSettings.isSet('DISPLAY_STOCKTAKE_TAB')
+      },
+      {
+        name: 'test_templates',
+        label: t`Test Templates`,
+        icon: <IconTestPipe />,
+        hidden: !part.testable,
+        content: part?.pk ? (
+          <PartTestTemplateTable
+            partId={part?.pk}
+            partLocked={
+              globalSettings.isSet('PART_ENABLE_LOCKING') && part?.locked
+            }
+          />
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'test_results',
+        label: t`Test Results`,
+        icon: <IconChecklist />,
+        hidden: !part.testable || !user.hasViewRole(UserRoles.stock),
+        content: part?.pk ? (
+          <PartTestResultTable partId={part.pk} />
+        ) : (
+          <Skeleton />
+        )
+      },
+      {
+        name: 'related_parts',
+        label: t`Related Parts`,
+        icon: <IconLayersLinked />,
+        content: <RelatedPartTable partId={part.pk} />
+      },
+      {
+        name: 'parameters',
+        label: t`Parameters`,
+        icon: <IconListDetails />,
+        content: (
+          <>
+            {lockingEnabled && part.locked && (
+              <Alert
+                title={t`Part is Locked`}
+                color='orange'
+                icon={<IconLock />}
+                p='xs'
+              >
+                <Text>{t`Part parameters cannot be edited, as the part is locked`}</Text>
+              </Alert>
+            )}
+            <ParameterTable
+              modelType={ModelType.part}
+              modelId={part?.pk}
+              allowEdit={!lockingEnabled || part?.locked != true}
+            />
+          </>
+        )
+      },
+      AttachmentPanel({
+        model_type: ModelType.part,
+        model_id: part?.pk
+      }),
+      NotesPanel({
+        model_type: ModelType.part,
+        model_id: part?.pk,
+        has_note: !!part?.notes
+      })
+    ];
+  }, [
+    id,
+    part,
+    user,
+    globalSettings,
+    userSettings,
+    bomInformation,
+    revisionSelector,
+    refreshInstance
+  ]);
+
+  const breadcrumbs = useMemo(() => {
+    return [
+      { name: t`Parts`, url: '/part' },
+      ...(part.category_path ?? []).map((c: any) => ({
+        name: c.name,
+        url: getDetailUrl(ModelType.partcategory, c.pk)
+      }))
+    ];
+  }, [part]);
+
+  const badges: ReactNode[] = useMemo(() => {
+    if (partRequirementsQuery.isFetching) {
+      return [];
+    }
+
+    const allocated =
+      partRequirements.allocated_to_build_orders +
+      partRequirements.allocated_to_sales_orders;
+
+    const required =
+      partRequirements.required_for_build_orders +
+      partRequirements.required_for_sales_orders;
+
+    const shortfall = Math.max(required - partRequirements.total_stock, 0);
+
+    let stockColor = 'green';
+
+    if (partRequirements.total_stock <= part.minimum_stock) {
+      stockColor = 'orange';
+    } else if (
+      part.maximum_stock > 0 &&
+      partRequirements.total_stock > part.maximum_stock
+    ) {
+      stockColor = 'teal';
+    }
+
+    return [
+      <DetailsBadge
+        label={`${t`In Stock`}: ${formatDecimal(partRequirements.total_stock)}`}
+        color={stockColor}
+        visible={!part.virtual && partRequirements.total_stock > 0}
+        key='in_stock'
+      />,
+      <DetailsBadge
+        label={`${t`Available`}: ${formatDecimal(partRequirements.unallocated_stock)}`}
+        color='yellow'
+        key='available_stock'
+        visible={
+          !part.virtual &&
+          partRequirements.unallocated_stock != partRequirements.total_stock
+        }
+      />,
+      <DetailsBadge
+        label={t`No Stock`}
+        color='orange'
+        visible={!part.virtual && partRequirements.total_stock == 0}
+        key='no_stock'
+      />,
+      <DetailsBadge
+        label={`${t`Allocated`}: ${formatDecimal(allocated)}`}
+        color='blue'
+        visible={allocated > 0}
+        key='allocated'
+      />,
+      <DetailsBadge
+        label={`${t`Required`}: ${formatDecimal(required)}`}
+        color='grape'
+        visible={required > 0}
+        key='required'
+      />,
+      <DetailsBadge
+        label={`${t`On Order`}: ${formatDecimal(partRequirements.ordering)}`}
+        color='blue'
+        visible={partRequirements.ordering > 0}
+        key='on_order'
+      />,
+      <DetailsBadge
+        label={`${t`In Production`}: ${formatDecimal(partRequirements.scheduled_to_build)}`}
+        color='blue'
+        visible={partRequirements.scheduled_to_build > 0}
+        key='in_production'
+      />,
+      <DetailsBadge
+        label={`${t`Deficit`}: ${formatDecimal(shortfall)}`}
+        color='red'
+        visible={shortfall > 0}
+        key='deficit'
+      />,
+      <DetailsBadge
+        label={t`Inactive`}
+        color='red'
+        visible={!part.active}
+        key='inactive'
+      />,
+      <DetailsBadge
+        label={t`Virtual`}
+        color='cyan.4'
+        visible={part.virtual}
+        key='virtual'
+      />,
+      <DetailsBadge
+        label={t`Consumable`}
+        color='cyan.4'
+        visible={part.consumable}
+        key='consumable'
+      />
+    ];
+  }, [partRequirements, partRequirementsQuery.isFetching, part]);
+
+  const partFields = usePartFields({
+    create: false,
+    partId: part.pk
+  });
+
+  const editPart = useEditApiFormModal({
+    url: ApiEndpoints.part_list,
+    pk: part.pk,
+    title: t`Edit Part`,
+    fields: partFields,
+    queryParams: new URLSearchParams({ tags: 'true' }),
+    onFormSuccess: refreshInstance
+  });
+
+  const duplicatePartFields = usePartFields({
+    create: true,
+    duplicatePartInstance: part
+  });
+
+  const duplicatePart = useCreateApiFormModal({
+    url: ApiEndpoints.part_list,
+    title: t`Add Part`,
+    fields: duplicatePartFields,
+    initialData: {
+      ...part,
+      active: true,
+      locked: false
+    },
+    follow: true,
+    modelType: ModelType.part
+  });
+
+  const deletePart = useDeleteApiFormModal({
+    url: ApiEndpoints.part_list,
+    pk: part.pk,
+    title: t`Delete Part`,
+    onFormSuccess: () => {
+      if (part.category) {
+        navigate(getDetailUrl(ModelType.partcategory, part.category));
+      } else {
+        navigate('/part/');
+      }
+    },
+    preFormContent: (
+      <Alert color='red' title={t`Deleting this part cannot be reversed`}>
+        <Stack gap='xs'>
+          <Thumbnail src={part.thumbnail ?? part.image} text={part.full_name} />
+        </Stack>
+      </Alert>
+    )
+  });
+
+  const stockOperationProps: StockOperationProps = useMemo(() => {
+    return {
+      refresh: refreshInstance,
+      filters: {
+        part: part.pk,
+        in_stock: true
+      }
+    };
+  }, [part]);
+
+  const stockAdjustActions = useStockAdjustActions({
+    formProps: stockOperationProps,
+    merge: false,
+    changeBatch: false,
+    enabled: true
+  });
+
+  const orderPartsWizard = OrderPartsWizard({
+    parts: [part]
+  });
+
+  const findBySerialNumber = useFindSerialNumberForm({ partId: part.pk });
+
+  const partActions = useMemo(() => {
+    return [
+      <AdminButton model={ModelType.part} id={part.pk} />,
+      <StarredToggleButton
+        key='starred_change'
+        instance={part}
+        model={ModelType.part}
+        successFunction={() => {
+          refreshInstance();
+        }}
+      />,
+      <BarcodeActionDropdown
+        model={ModelType.part}
+        pk={part.pk}
+        hash={part?.barcode_hash}
+        perm={user.hasChangeRole(UserRoles.part)}
+        key='action_dropdown'
+      />,
+      <PrintingActions
+        modelType={ModelType.part}
+        items={[part.pk]}
+        enableReports
+        enableLabels
+      />,
+      <ActionDropdown
+        tooltip={t`Stock Actions`}
+        icon={<IconPackages />}
+        hidden={part.virtual || !user.hasViewRole(UserRoles.stock)}
+        actions={[
+          ...stockAdjustActions.menuActions,
+          {
+            name: t`Order`,
+            tooltip: t`Order Stock`,
+            hidden:
+              !user.hasAddRole(UserRoles.purchase_order) ||
+              !part?.active ||
+              !part?.purchaseable,
+            icon: <IconShoppingCart color='blue' />,
+            onClick: () => {
+              orderPartsWizard.openWizard();
+            }
+          },
+          {
+            name: t`Search`,
+            tooltip: t`Search by serial number`,
+            hidden: !part.trackable,
+            icon: <IconSearch />,
+            onClick: findBySerialNumber.open
+          }
+        ]}
+      />,
+      <OptionsActionDropdown
+        tooltip={t`Part Actions`}
+        actions={[
+          DuplicateItemAction({
+            hidden: !user.hasAddRole(UserRoles.part),
+            onClick: () => duplicatePart.open()
+          }),
+          EditItemAction({
+            hidden: !user.hasChangeRole(UserRoles.part),
+            onClick: () => editPart.open()
+          }),
+          DeleteItemAction({
+            hidden: !user.hasDeleteRole(UserRoles.part),
+            disabled: part.active,
+            onClick: () => deletePart.open()
+          })
+        ]}
+      />
+    ];
+  }, [id, part, user, stockAdjustActions.menuActions]);
+
+  return (
+    <>
+      {editPart.modal}
+      {deletePart.modal}
+      {duplicatePart.modal}
+      {orderPartsWizard.wizard}
+      {findBySerialNumber.modal}
+      {stockAdjustActions.modals.map((modal) => modal.modal)}
+      <InstanceDetail query={instanceQuery} requiredRole={UserRoles.part}>
+        <Stack gap='xs'>
+          {user.hasViewRole(UserRoles.part_category) && (
+            <NavigationTree
+              title={t`Part Categories`}
+              childIdentifier='subcategories'
+              modelType={ModelType.partcategory}
+              endpoint={ApiEndpoints.category_tree}
+              opened={treeOpen}
+              onClose={() => {
+                setTreeOpen(false);
+              }}
+              selectedId={part?.category}
+            />
+          )}
+          <PageDetail
+            title={`${t`Part`}: ${part.full_name}`}
+            icon={
+              lockingEnabled ? (
+                <ActionIcon
+                  aria-label='part-lock-icon'
+                  variant='transparent'
+                  disabled={!user.hasChangeRole(UserRoles.part)}
+                  onClick={() => {
+                    const locking = !part.locked;
+                    api
+                      .patch(apiUrl(ApiEndpoints.part_list, part.pk), {
+                        locked: locking
+                      })
+                      .then(() => {
+                        notifications.hide('part-lock');
+                        notifications.show({
+                          id: 'part-lock',
+                          message: locking ? t`Part locked` : t`Part unlocked`,
+                          color: 'green',
+                          icon: locking ? (
+                            <IconLock size='1rem' />
+                          ) : (
+                            <IconLockOpen size='1rem' />
+                          )
+                        });
+                        refreshInstance();
+                      });
+                  }}
+                >
+                  {part?.locked ? <IconLock /> : <IconLockOpen />}
+                </ActionIcon>
+              ) : undefined
+            }
+            subtitle={part.description}
+            imageUrl={part.image}
+            thumbnailUrl={part.thumbnail}
+            badges={badges}
+            breadcrumbs={
+              user.hasViewRole(UserRoles.part_category)
+                ? breadcrumbs
+                : undefined
+            }
+            lastCrumb={[
+              {
+                name: part.name,
+                url: `/part/${part.pk}/`
+              }
+            ]}
+            breadcrumbAction={() => {
+              setTreeOpen(true);
+            }}
+            editAction={editPart.open}
+            editEnabled={user.hasChangeRole(UserRoles.part)}
+            actions={partActions}
+          />
+          <PanelGroup
+            pageKey='part'
+            panels={partPanels}
+            instance={part}
+            reloadInstance={refreshInstance}
+            model={ModelType.part}
+            id={part.pk}
+          />
+        </Stack>
+      </InstanceDetail>
+    </>
+  );
+}

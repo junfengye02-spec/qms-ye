@@ -1,0 +1,1388 @@
+"""Custom template tags for report generation."""
+
+import base64
+import copy
+import logging
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Optional
+
+from django import template
+from django.apps.registry import apps
+from django.conf import settings
+from django.contrib.staticfiles.storage import staticfiles_storage
+from django.core.exceptions import SuspiciousFileOperation, ValidationError
+from django.core.files.storage import default_storage
+from django.db.models import Model
+from django.db.models.query import QuerySet
+from django.utils import translation
+from django.utils.safestring import SafeString, mark_safe
+from django.utils.translation import gettext_lazy as _
+
+from babel import Locale
+from babel.core import UnknownLocaleError
+from babel.dates import format_date as babel_format_date
+from babel.dates import format_datetime as babel_format_datetime
+from babel.numbers import format_decimal as babel_format_decimal
+from babel.numbers import parse_pattern
+from djmoney.contrib.exchange.exceptions import MissingRate
+from djmoney.contrib.exchange.models import convert_money
+from djmoney.money import Money
+from PIL import Image
+
+import common.currency
+import common.icons
+import common.models
+import InvenTree.helpers
+import InvenTree.helpers_model
+import report.helpers
+from common.settings import get_global_setting
+from company.models import Company
+from part.models import Part
+
+register = template.Library()
+
+
+logger = logging.getLogger('inventree')
+
+
+def get_locale(locale: Optional[str] = None) -> Locale:
+    """Resolve and return a babel Locale.
+
+    Args:
+        locale: Optional locale string (e.g. 'en-us'). Falls back to LANGUAGE_CODE.
+
+    Raises:
+        ValidationError: If the locale string is invalid.
+    """
+    language = locale or settings.LANGUAGE_CODE
+    try:
+        return Locale.parse(translation.to_locale(language))
+    except (UnknownLocaleError, ValueError) as e:
+        raise ValidationError(f"Invalid locale '{language}' - {e}")
+
+
+@register.simple_tag()
+def order_queryset(queryset: QuerySet, *args) -> QuerySet:
+    """Order a database queryset based on the provided arguments.
+
+    Arguments:
+        queryset: The queryset to order
+
+    Keyword Arguments:
+        field (str): Order the queryset based on the provided field
+
+    Example:
+        {% order_queryset companies 'name' as ordered_companies %}
+    """
+    if not isinstance(queryset, QuerySet):
+        return queryset
+
+    return queryset.order_by(*args)
+
+
+@register.simple_tag()
+def filter_queryset(queryset: QuerySet, **kwargs) -> QuerySet:
+    """Filter a database queryset based on the provided keyword arguments.
+
+    Arguments:
+        queryset: The queryset to filter
+
+    Keyword Arguments:
+        field (any): Filter the queryset based on the provided field
+
+    Example:
+        {% filter_queryset companies is_supplier=True as suppliers %}
+    """
+    if not isinstance(queryset, QuerySet):
+        return queryset
+    return queryset.filter(**kwargs)
+
+
+@register.simple_tag()
+def filter_db_model(model_name: str, **kwargs) -> Optional[QuerySet]:
+    """Filter a database model based on the provided keyword arguments.
+
+    Arguments:
+        model_name: The name of the Django model - including app name (e.g. 'part.partcategory')
+
+    Keyword Arguments:
+        field (any): Filter the queryset based on the provided field
+
+    Example:
+        {% filter_db_model 'part.partcategory' is_template=True as template_parts %}
+    """
+    try:
+        app_name, model_name = model_name.split('.')
+    except ValueError:
+        return None
+
+    try:
+        model = apps.get_model(app_name, model_name)
+    except Exception:
+        return None
+
+    if model is None:
+        return None
+
+    queryset = model.objects.all()
+
+    return filter_queryset(queryset, **kwargs)
+
+
+@register.simple_tag()
+def getindex(container: list, index: int) -> Any:
+    """Return the value contained at the specified index of the list.
+
+    This function is provided to get around template rendering limitations.
+
+    Arguments:
+        container: A python list object
+        index: The index to retrieve from the list
+    """
+    # Index *must* be an integer
+    try:
+        index = int(index)
+    except ValueError:
+        return None
+
+    if index < 0 or index >= len(container):
+        return None
+    return container[index]
+
+
+@register.simple_tag()
+def getkey(container: dict, key: str, backup_value: Optional[Any] = None) -> Any:
+    """Perform key lookup in the provided dict object.
+
+    This function is provided to get around template rendering limitations.
+    Ref: https://stackoverflow.com/questions/1906129/dict-keys-with-spaces-in-django-templates
+
+    Arguments:
+        container: A python dict object
+        key: The 'key' to be found within the dict
+        backup_value: A backup value to return if the key is not found
+    """
+    if type(container) is not dict:
+        logger.warning('getkey() called with non-dict object')
+        return None
+
+    return container.get(key, backup_value)
+
+
+def media_file_exists(path: Path | str) -> bool:
+    """Check if a media file exists at the specified path.
+
+    Arguments:
+        path: The path to the media file, relative to the media storage root
+
+    Returns:
+        True if the file exists, False otherwise
+    """
+    if not path:
+        return False
+
+    try:
+        return default_storage.exists(str(path))
+    except SuspiciousFileOperation:
+        # Prevent path traversal attacks
+        raise ValidationError(_('Invalid media file path') + f": '{path}'")
+
+
+def static_file_exists(path: Path | str) -> bool:
+    """Check if a static file exists at the specified path.
+
+    Arguments:
+        path: The path to the static file, relative to the static storage root
+
+    Returns:
+        True if the file exists, False otherwise
+    """
+    if not path:
+        return False
+
+    try:
+        return staticfiles_storage.exists(str(path))
+    except SuspiciousFileOperation:
+        # Prevent path traversal attacks
+        raise ValidationError(_('Invalid static file path') + f": '{path}'")
+
+
+def get_static_file_contents(
+    path: Path | str, raise_error: bool = False
+) -> bytes | None:
+    """Return the contents of a static file.
+
+    Arguments:
+        path: The path to the static file, relative to the static storage root
+        raise_error: If True, raise an error if the file cannot be found (default = False)
+
+    Returns:
+        The contents of the static file, or None if the file cannot be found
+    """
+    if not path:
+        if raise_error:
+            raise ValueError('No static file specified')
+        else:
+            return None
+
+    if not staticfiles_storage.exists(path):
+        if raise_error:
+            raise FileNotFoundError(f'Static file does not exist: {path!s}')
+        else:
+            return None
+
+    with staticfiles_storage.open(str(path)) as f:
+        file_data = f.read()
+
+    return file_data
+
+
+def get_media_file_contents(
+    path: Path | str, raise_error: bool = False
+) -> bytes | None:
+    """Return the fully qualified file path to an uploaded media file.
+
+    Arguments:
+        path: The path to the media file, relative to the media storage root
+        raise_error: If True, raise an error if the file cannot be found (default = False)
+
+    Returns:
+        The contents of the media file, or None if the file cannot be found
+
+    Raises:
+        FileNotFoundError: If the requested media file cannot be loaded
+        PermissionError: If the requested media file is outside of the media root
+        ValidationError: If the provided path is invalid
+
+    Notes:
+        - The resulting path is resolved against the media root directory
+    """
+    if not path:
+        if raise_error:
+            raise ValueError('No media file specified')
+        else:
+            return None
+
+    if not media_file_exists(path):
+        if raise_error:
+            raise FileNotFoundError(f'Media file does not exist: {path!s}')
+        else:
+            return None
+
+    # Load the file - and return the contents
+    with default_storage.open(str(path)) as f:
+        file_data = f.read()
+
+    return file_data
+
+
+@register.simple_tag()
+def asset(filename: str, raise_error: bool = False) -> str | None:
+    """Return fully-qualified path for an upload report asset file.
+
+    Arguments:
+        filename: Asset filename (relative to the 'assets' media directory)
+        raise_error: If True, raise an error if the file cannot be found (default = False)
+
+    Raises:
+        FileNotFoundError: If file does not exist
+        ValueError: If an invalid filename is provided (e.g. empty string)
+        ValidationError: If the filename is invalid (e.g. path traversal attempt)
+    """
+    if not filename:
+        if raise_error:
+            raise ValueError('No asset file specified')
+        else:
+            return None
+
+    if type(filename) is SafeString:
+        # Prepend an empty string to enforce 'stringiness'
+        filename = '' + filename
+
+    # Remove any leading slash characters from the filename, to prevent path traversal attacks
+    filename = str(filename).lstrip('/\\')
+
+    full_path = Path('report', 'assets', filename)
+
+    if not media_file_exists(full_path):
+        if raise_error:
+            raise FileNotFoundError(_('Asset file not found') + f": '{filename}'")
+        else:
+            return None
+
+    # In debug mode, return a web URL to the asset file (rather than encoded data)
+    if get_global_setting('REPORT_DEBUG_MODE', cache=False):
+        return default_storage.url(str(full_path))
+
+    file_data = get_media_file_contents(full_path, raise_error=raise_error)
+
+    if not file_data:
+        return None
+
+    return report.helpers.encode_file_base64(filename, file_data)
+
+
+@register.simple_tag()
+def uploaded_image(
+    filename: str,
+    replace_missing: bool = True,
+    replacement_file: str = 'blank_image.png',
+    validate: bool = True,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    rotate: Optional[float] = None,
+    raise_error: bool = False,
+    **kwargs,
+) -> str:
+    """Return raw image data from an 'uploaded' image.
+
+    Arguments:
+        filename: The filename of the image relative to the media root directory
+        replace_missing: Optionally return a placeholder image if the provided filename does not exist (default = True)
+        replacement_file: The filename of the placeholder image (default = 'blank_image.png')
+        validate: Optionally validate that the file is a valid image file
+        width: Optional width of the image
+        height: Optional height of the image
+        rotate: Optional rotation to apply to the image
+        raise_error: If True, raise an error if the file cannot be found (default = False)
+
+    Returns:
+        Binary image data to be rendered directly in a <img> tag
+
+    Raises:
+        FileNotFoundError: If the file does not exist
+        ValueError: If an invalid filename is provided (e.g. empty string)
+    """
+    if type(filename) is SafeString:
+        # Prepend an empty string to enforce 'stringiness'
+        filename = '' + filename
+
+    # Strip out any leading slash characters from the filename, to prevent path traversal attacks
+    filename = str(filename).lstrip('/\\')
+
+    # If in debug mode, return URL to the image, not a local file
+    debug_mode = get_global_setting('REPORT_DEBUG_MODE', cache=False)
+
+    # Load image data - this will check if the file exists
+    exists = bool(filename) and media_file_exists(filename)
+
+    if not exists and not replace_missing:
+        raise FileNotFoundError(_('Image file not found') + f": '{filename}'")
+
+    if exists:
+        img_data = get_media_file_contents(filename, raise_error=raise_error)
+
+        # Check if the image data is valid
+        if (
+            img_data
+            and validate
+            and not InvenTree.helpers.TestIfImage(BytesIO(img_data))
+        ):
+            logger.warning("File '%s' is not a valid image", filename)
+            img_data = None
+            exists = False
+    else:
+        # Load the backup image from the static files directory
+        replacement_file_path = Path('img', replacement_file)
+        img_data = get_static_file_contents(
+            replacement_file_path, raise_error=raise_error
+        )
+
+    if debug_mode:
+        # In debug mode, return a web path (rather than an encoded image blob)
+        if exists:
+            return default_storage.url(filename)
+
+        return staticfiles_storage.url(str(Path('img', replacement_file)))
+
+    if img_data:
+        img = Image.open(BytesIO(img_data))
+    else:
+        # A placeholder image showing that the image is missing
+        img = Image.new('RGB', (64, 64), color='red')
+
+    if width is not None:
+        try:
+            width = int(width)
+        except ValueError:
+            width = None
+
+    if height is not None:
+        try:
+            height = int(height)
+        except ValueError:
+            height = None
+
+    if width is not None and height is not None:
+        # Resize the image, width *and* height are provided
+        img = img.resize((width, height))
+    elif width is not None:
+        # Resize the image, width only
+        wpercent = width / float(img.size[0])
+        hsize = int(float(img.size[1]) * float(wpercent))
+        img = img.resize((width, hsize))
+    elif height is not None:
+        # Resize the image, height only
+        hpercent = height / float(img.size[1])
+        wsize = int(float(img.size[0]) * float(hpercent))
+        img = img.resize((wsize, height))
+
+    # Optionally rotate the image
+    if rotate is not None:
+        try:
+            rotate = int(rotate)
+            img = img.rotate(rotate)
+        except ValueError:
+            pass
+
+    # Return a base-64 encoded image
+    img_data = report.helpers.encode_image_base64(img)
+
+    return img_data
+
+
+@register.simple_tag()
+def encode_svg_image(filename: str, raise_error: bool = False) -> str:
+    """Return a base64-encoded svg image data string.
+
+    Arguments:
+        filename: The filename of the svg image relative to the media root directory
+        raise_error: If True, raise an error if the file cannot be found (default = False)
+    """
+    if type(filename) is SafeString:
+        # Prepend an empty string to enforce 'stringiness'
+        filename = '' + filename
+
+    # Remove any leading slash characters from the filename, to prevent path traversal attacks
+    filename = str(filename).lstrip('/\\')
+
+    if not filename:
+        raise FileNotFoundError(_('No image file specified'))
+
+    # Read out the file contents
+    # Note: This will check if the file exists, and raise an error if it does not
+    data = get_media_file_contents(filename, raise_error=raise_error)
+
+    # If the file is empty, return an empty string
+    # Note that if raise_error is True, the above function will raise a FileNotFoundError if the file does not exist
+    if not data:
+        return ''
+
+    # Return the base64-encoded data
+    return 'data:image/svg+xml;charset=utf-8;base64,' + base64.b64encode(data).decode(
+        'utf-8'
+    )
+
+
+@register.simple_tag()
+def part_image(part: Part, preview: bool = False, thumbnail: bool = False, **kwargs):
+    """Return a fully-qualified path for a part image.
+
+    Arguments:
+        part: A Part model instance
+        preview: Return the preview image (default = False)
+        thumbnail: Return the thumbnail image (default = False)
+
+    Raises:
+        TypeError: If provided part is not a Part instance
+    """
+    if not part or not isinstance(part, Part):
+        raise ValidationError(_('part_image tag requires a Part instance'))
+
+    image_filename = InvenTree.helpers.image2name(part.image, preview, thumbnail)
+
+    if kwargs.get('check_exists'):
+        if not media_file_exists(image_filename):
+            raise FileNotFoundError(_('Image file not found') + f": '{image_filename}'")
+
+    return uploaded_image(
+        InvenTree.helpers.image2name(part.image, preview, thumbnail), **kwargs
+    )
+
+
+@register.simple_tag()
+def parameter(
+    instance: Model, parameter_name: str
+) -> Optional[common.models.Parameter]:
+    """Return a Parameter object for the given part and parameter name.
+
+    Arguments:
+        instance: A Model object
+        parameter_name: The name of the parameter to retrieve (case insensitive)
+
+    Returns:
+        A Parameter object, or the provided default value if not found
+    """
+    if instance is None or not isinstance(instance, Model):
+        raise ValidationError('parameter tag requires a valid Model instance')
+
+    if not hasattr(instance, 'parameters'):
+        raise ValidationError(
+            "parameter tag requires a Model with 'parameters' attribute"
+        )
+
+    parameters = instance.parameters_list.all().prefetch_related('template')
+
+    # First try with exact match
+    if parameter := parameters.filter(template__name=parameter_name).first():
+        return parameter
+
+    # Next, try with case-insensitive match
+    if parameter := parameters.filter(template__name__iexact=parameter_name).first():
+        return parameter
+
+    return None
+
+
+@register.simple_tag()
+def parameter_value(
+    instance: Model, parameter_name: str, backup_value: Optional[Any] = None
+) -> str:
+    """Return the value of a Parameter for the given part and parameter name.
+
+    Arguments:
+        instance: A Model object
+        parameter_name: The name of the parameter to retrieve (case insensitive)
+        backup_value: A backup value to return if the parameter is not found
+
+    Returns:
+        The value of the Parameter, or the backup_value if not found
+    """
+    if param := parameter(instance, parameter_name):
+        return param.data
+
+    # If the matching parameter is not found, return the backup value
+    return backup_value
+
+
+@register.simple_tag()
+def part_parameter(instance, parameter_name):
+    """Included for backwards compatibility - use 'parameter' tag instead.
+
+    Ref: https://github.com/inventree/InvenTree/pull/10699
+    """
+    return parameter(instance, parameter_name)
+
+
+@register.simple_tag()
+def company_image(
+    company: Company, preview: bool = False, thumbnail: bool = False, **kwargs
+) -> str:
+    """Return a fully-qualified path for a company image.
+
+    Arguments:
+        company: A Company model instance
+        preview: Return the preview image (default = False)
+        thumbnail: Return the thumbnail image (default = False)
+
+    Raises:
+        TypeError: If provided company is not a Company instance
+    """
+    if type(company) is not Company:
+        raise TypeError(_('company_image tag requires a Company instance'))
+    return uploaded_image(
+        InvenTree.helpers.image2name(company.image, preview, thumbnail), **kwargs
+    )
+
+
+@register.simple_tag()
+def logo_image(**kwargs) -> str:
+    """Return a fully-qualified path for the logo image.
+
+    - If a custom logo has been provided, return a path to that logo
+    - Otherwise, return a path to the default InvenTree logo
+    """
+    # If in debug mode, return URL to the image, not a local file
+    debug_mode = get_global_setting('REPORT_DEBUG_MODE', cache=False)
+
+    return InvenTree.helpers.getLogoImage(as_file=not debug_mode, **kwargs)
+
+
+@register.simple_tag()
+def internal_link(link, text) -> str:
+    """Make a <a></a> href which points to an InvenTree URL.
+
+    Uses the InvenTree.helpers_model.construct_absolute_url function to build the URL.
+    """
+    text = str(text)
+
+    try:
+        url = InvenTree.helpers_model.construct_absolute_url(link)
+    except Exception:
+        url = None
+
+    # If the base URL is not set, just return the text
+    if not url:
+        logger.warning('Failed to construct absolute URL for internal link')
+        return text
+
+    return mark_safe(f'<a href="{url}">{text}</a>')
+
+
+def make_decimal(value: Any) -> Any:
+    """Convert an input value into a Decimal.
+
+    - Converts [string, int, float] types into Decimal
+    - If conversion fails, returns the original value
+
+    The purpose of this function is to provide "seamless" math operations in templates,
+    where numeric values may be provided as strings, or converted to strings during template rendering.
+    """
+    if any(isinstance(value, t) for t in [int, float, str]):
+        try:
+            value = Decimal(str(value).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            logger.warning(
+                'make_decimal: Failed to convert value to Decimal: %s (%s)',
+                value,
+                type(value),
+            )
+
+    return value
+
+
+def cast_to_type(value: Any, cast: type) -> Any:
+    """Attempt to cast a value to the provided type.
+
+    If casting fails, the original value is returned.
+    """
+    if cast is not None:
+        try:
+            value = cast(value)
+        except (ValueError, TypeError):
+            pass
+
+    return value
+
+
+def debug_vars(x: Any, y: Any) -> str:
+    """Return a debug string showing the types and values of two variables."""
+    return f"x='{x}' ({type(x).__name__}), y='{y}' ({type(y).__name__})"
+
+
+def check_nulls(func: str, *arg):
+    """Check if any of the provided arguments is null.
+
+    Raises:
+        ValueError: If any argument is None
+    """
+    if any(a is None for a in arg):
+        raise ValidationError(f'{func}: {_("Null value provided to function")}')
+
+
+@register.simple_tag()
+def add(x: Any, y: Any, cast: Optional[type] = None) -> Any:
+    """Add two numbers (or number like values) together.
+
+    Arguments:
+        x: The first value to add
+        y: The second value to add
+        cast: Optional type to cast the result to (e.g. int, float, str)
+
+    Raises:
+        ValidationError: If the values cannot be added together
+    """
+    check_nulls('add', x, y)
+
+    try:
+        result = make_decimal(x) + make_decimal(y)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError(
+            f'add: {_("Cannot add values of incompatible types")}: {debug_vars(x, y)}'
+        )
+    return cast_to_type(result, cast)
+
+
+@register.simple_tag()
+def subtract(x: Any, y: Any, cast: Optional[type] = None) -> Any:
+    """Subtract one number (or number-like value) from another.
+
+    Arguments:
+        x: The value to be subtracted from
+        y: The value to be subtracted
+        cast: Optional type to cast the result to (e.g. int, float, str)
+
+    Raises:
+        ValidationError: If the values cannot be subtracted
+    """
+    check_nulls('subtract', x, y)
+
+    try:
+        result = make_decimal(x) - make_decimal(y)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError(
+            f'subtract: {_("Cannot subtract values of incompatible types")}: {debug_vars(x, y)}'
+        )
+
+    return cast_to_type(result, cast)
+
+
+@register.simple_tag()
+def multiply(x: Any, y: Any, cast: Optional[type] = None) -> Any:
+    """Multiply two numbers (or number-like values) together.
+
+    Arguments:
+        x: The first value to multiply
+        y: The second value to multiply
+        cast: Optional type to cast the result to (e.g. int, float, str)
+
+    Raises:
+        ValidationError: If the values cannot be multiplied together
+    """
+    check_nulls('multiply', x, y)
+
+    try:
+        result = make_decimal(x) * make_decimal(y)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError(
+            f'multiply: {_("Cannot multiply values of incompatible types")}: {debug_vars(x, y)}'
+        )
+
+    return cast_to_type(result, cast)
+
+
+@register.simple_tag()
+def divide(x: Any, y: Any, cast: Optional[type] = None) -> Any:
+    """Divide one number (or number-like value) by another.
+
+    Arguments:
+        x: The value to be divided
+        y: The value to divide by
+        cast: Optional type to cast the result to (e.g. int, float, str)
+
+    Raises:
+        ValidationError: If the values cannot be divided
+    """
+    check_nulls('divide', x, y)
+
+    try:
+        result = make_decimal(x) / make_decimal(y)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError(
+            f'divide: {_("Cannot divide values of incompatible types")}: {debug_vars(x, y)}'
+        )
+    except ZeroDivisionError:
+        raise ValidationError(
+            f'divide: {_("Cannot divide by zero")}: {debug_vars(x, y)}'
+        )
+
+    return cast_to_type(result, cast)
+
+
+@register.simple_tag()
+def modulo(x: Any, y: Any, cast: Optional[type] = None) -> Any:
+    """Calculate the modulo of one number (or number-like value) by another.
+
+    Arguments:
+        x: The first value to be used in the modulo operation
+        y: The second value to be used in the modulo operation
+        cast: Optional type to cast the result to (e.g. int, float, str)
+
+    Raises:
+        ValidationError: If the values cannot be used in a modulo operation
+    """
+    check_nulls('modulo', x, y)
+
+    try:
+        result = make_decimal(x) % make_decimal(y)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError(
+            f'modulo: {_("Cannot perform modulo operation with values of incompatible types")} {debug_vars(x, y)}'
+        )
+    except ZeroDivisionError:
+        raise ValidationError(
+            f'modulo: {_("Cannot perform modulo operation with divisor of zero")}: {debug_vars(x, y)}'
+        )
+
+    return cast_to_type(result, cast)
+
+
+@register.simple_tag
+def render_currency(
+    money: Money | str | int | float | Decimal,
+    decimal_places: Optional[int] = None,
+    currency: Optional[str] = None,
+    multiplier: Optional[Decimal] = None,
+    max_decimal_places: Optional[int] = None,
+    include_symbol: bool = True,
+    leading: Optional[int] = None,
+    fmt: Optional[str] = None,
+    locale: Optional[str] = None,
+    **kwargs,
+) -> str:
+    """Render a currency / Money object to a formatted string.
+
+    Arguments:
+        money: The Money instance to be rendered
+        currency: Optionally convert to the specified currency before rendering
+        multiplier: Optional multiplier to apply to the amount before rendering
+        decimal_places: Minimum (forced) decimal places, e.g. decimal_places=2 gives '.00'. Defaults to the locale/currency standard.
+        max_decimal_places: Maximum decimal places (optional digits beyond decimal_places), e.g. max_decimal_places=4 allows up to 4.
+        include_symbol: If True, include the currency symbol in the output
+        leading: Minimum number of leading digits to render before the decimal point (default = 1)
+        fmt: Optional Babel number pattern string. When provided, takes priority over all other formatting options.
+        locale: Optional locale override (e.g. 'en-us', 'de-de'). Defaults to server LANGUAGE_CODE.
+    """
+    if money in [None, '']:
+        return '-'
+
+    # If the supplied value is *not* a Money instance, attempt to convert it into one
+    if not isinstance(money, Money):
+        try:
+            money = Money(
+                Decimal(str(money)),
+                currency or get_global_setting('INVENTREE_DEFAULT_CURRENCY'),
+            )
+        except Exception:
+            raise ValidationError(f'render_currency: invalid money value - {money!r}')
+
+    if currency is not None:
+        try:
+            money = convert_money(money, currency)
+        except Exception:
+            pass
+
+    if multiplier is not None:
+        try:
+            money *= Decimal(str(multiplier).strip())
+        except Exception:
+            raise ValidationError(
+                f'render_currency: invalid multiplier value - {multiplier!r}'
+            )
+
+    locale = get_locale(locale)
+
+    # If a custom fmt pattern is applied, that overrides other formatting options
+    if fmt:
+        pattern = parse_pattern(fmt)
+        return pattern.apply(
+            money.amount,
+            locale,
+            currency=money.currency.code if include_symbol else '',
+            currency_digits=False,
+            decimal_quantization=True,
+        )
+
+    pattern = copy.copy(locale.currency_formats['standard'])
+
+    if decimal_places is None or not isinstance(decimal_places, (int, float)):
+        decimal_places = get_global_setting('PRICING_DECIMAL_PLACES_MIN', 0)
+
+    if max_decimal_places is None or not isinstance(max_decimal_places, (int, float)):
+        max_decimal_places = get_global_setting('PRICING_DECIMAL_PLACES', 6)
+
+    pattern.frac_prec = (decimal_places, max(decimal_places, max_decimal_places))
+
+    if leading is not None:
+        try:
+            leading = int(leading) or 0
+        except (ValueError, TypeError):
+            leading = 0
+        if leading > 0:
+            min_int, max_int = pattern.int_prec
+            pattern.int_prec = (max(leading, min_int), max(leading, max_int))
+
+    return pattern.apply(
+        money.amount,
+        locale,
+        currency=money.currency.code if include_symbol else '',
+        currency_digits=decimal_places is None and max_decimal_places is None,
+        decimal_quantization=decimal_places is not None
+        or max_decimal_places is not None,
+    )
+
+
+@register.simple_tag
+def create_currency(
+    amount: str | int | float | Decimal, currency: Optional[str] = None, **kwargs
+):
+    """Create a Money object, with the provided amount and currency.
+
+    Arguments:
+        amount: The numeric amount (a numeric type or string)
+        currency: The currency code (e.g. 'USD', 'EUR', etc.)
+
+    Note: If the currency is not provided, the default system currency will be used.
+    """
+    check_nulls('create_currency', amount)
+
+    currency = currency or common.currency.currency_code_default()
+    currency = currency.strip().upper()
+
+    if currency not in common.currency.CURRENCIES:
+        raise ValidationError(
+            f'create_currency: {_("Invalid currency code")}: {currency}'
+        )
+
+    try:
+        money = Money(amount, currency)
+    except InvalidOperation:
+        raise ValidationError(f'create_currency: {_("Invalid amount")}: {amount}')
+
+    return money
+
+
+@register.simple_tag
+def convert_currency(money: Money, currency: Optional[str] = None, **kwargs):
+    """Convert a Money object to the specified currency.
+
+    Arguments:
+        money: The Money instance to be converted
+        currency: The target currency code (e.g. 'USD', 'EUR', etc.)
+
+    Note: If the currency is not provided, the default system currency will be used.
+    """
+    check_nulls('convert_currency', money)
+
+    if not isinstance(money, Money):
+        raise TypeError('convert_currency tag requires a Money instance')
+
+    currency = currency or common.currency.currency_code_default()
+    currency = currency.strip().upper()
+
+    if currency not in common.currency.CURRENCIES:
+        raise ValidationError(
+            f'convert_currency: {_("Invalid currency code")}: {currency}'
+        )
+
+    try:
+        converted = convert_money(money, currency)
+    except MissingRate:
+        # Re-throw error with more context
+        raise ValidationError(
+            f'convert_currency: {_("Missing exchange rate")} {money.currency} -> {currency}'
+        )
+
+    return converted
+
+
+@register.simple_tag
+def render_html_text(text: str, **kwargs):
+    """Render a text item with some simple html tags.
+
+    kwargs:
+        bold: Boolean, whether bold (or not)
+        italic: Boolean, whether italic (or not)
+        heading: str, heading level e.g. 'h3'
+    """
+    tags = []
+
+    if kwargs.get('bold'):
+        tags.append('strong')
+
+    if kwargs.get('italic'):
+        tags.append('em')
+
+    if heading := kwargs.get('heading', ''):
+        tags.append(heading)
+
+    output = ''.join([f'<{tag}>' for tag in tags])
+    output += text
+    output += ''.join([f'</{tag}>' for tag in tags])
+
+    return mark_safe(output)
+
+
+@register.simple_tag
+def format_number(
+    number: int | float | Decimal,
+    multiplier: Optional[int | float | Decimal] = None,
+    integer: bool = False,
+    separator: bool = False,
+    leading: Optional[int] = None,
+    decimal_places: Optional[int] = None,
+    max_decimal_places: Optional[int] = None,
+    fmt: Optional[str] = None,
+    locale: Optional[str] = None,
+    **kwargs,
+) -> str:
+    """Render a number with optional formatting options.
+
+    Arguments:
+        number: The number to be formatted
+        multiplier: Optional multiplier to apply to the number before formatting
+        integer: Boolean, whether to render the number as an integer
+        separator: Boolean, whether to include a thousands separator
+        leading: Minimum number of leading digits to render (default = 1)
+        decimal_places: Number of decimal places to render (default = 0)
+        max_decimal_places: Maximum number of decimal places to render (default = 0)
+        separator:
+        fmt: Optional format string for the number - if provided, takes priority over 'decimal_places' and 'leading'
+        locale: Optional locale override (e.g. 'en-us', 'de-de'). When set, babel controls decimal and thousands separators.
+    """
+    check_nulls('format_number', number)
+
+    # Check that the provided number is valid
+    try:
+        number = Decimal(str(number).strip())
+    except Exception:
+        # If the number cannot be converted to a Decimal, just return the original value
+        return str(number)
+
+    number = float(number)
+
+    if multiplier is not None:
+        number *= float(multiplier)
+
+    if integer:
+        number = int(number)
+
+    # Construct a formatting string for the number, based on the provided options
+    if not fmt:
+        fmt = '###,###,###,###,##0'  # Default format string - this will be modified based on the provided options
+
+        # The 'leading' option specifies the minimum number of leading digits to render (not including decimal places)
+        if leading is not None:
+            try:
+                leading = int(leading) or 0
+            except (ValueError, TypeError):
+                leading = 0
+
+            if leading > 1:
+                fmt = fmt[::-1].replace('#', '0', (leading - 1))[::-1]
+
+        if not bool(separator):
+            fmt = fmt.replace(',', '')
+
+        if decimal_places is not None or max_decimal_places is not None:
+            # Account for decimal places, if provided
+
+            try:
+                decimal_places = int(decimal_places) or 0
+            except (ValueError, TypeError):
+                decimal_places = 0
+
+            try:
+                max_decimal_places = int(max_decimal_places) or 0
+            except (ValueError, TypeError):
+                max_decimal_places = 0
+
+            fmt += '.' + '0' * decimal_places
+
+            if max_decimal_places > decimal_places:
+                fmt += '#' * (max_decimal_places - decimal_places)
+        elif not integer:
+            # No decimal places specified, allow any number of decimal places (up to the precision of the Decimal)
+            fmt += '.####################'
+
+    babel_locale = get_locale(locale)
+
+    return babel_format_decimal(
+        number, format=fmt, locale=babel_locale, numbering_system='latn'
+    )
+
+
+@register.simple_tag
+def format_datetime(
+    dt: datetime,
+    timezone: Optional[str] = None,
+    fmt: Optional[str] = None,
+    locale: Optional[str] = None,
+    date_format: str = 'medium',
+    **kwargs,
+):
+    """Format a datetime object for display.
+
+    Arguments:
+        dt: The datetime object to format
+        timezone: The timezone to use for the date (defaults to the server timezone)
+        fmt: The strftime format string to use. When provided, takes priority over locale and date_format.
+        locale: Optional locale override (e.g. 'en-us', 'de-de'). Used for locale-aware formatting when no fmt is given.
+        date_format: Babel date format style. One of 'full', 'long', 'medium' (default), 'short'.
+    """
+    check_nulls('format_datetime', dt)
+
+    dt = InvenTree.helpers.to_local_time(dt, timezone)
+
+    if fmt:
+        return dt.strftime(fmt)
+
+    return babel_format_datetime(dt, format=date_format, locale=get_locale(locale))
+
+
+@register.simple_tag
+def format_date(
+    dt: date,
+    timezone: Optional[str] = None,
+    fmt: Optional[str] = None,
+    locale: Optional[str] = None,
+    date_format: str = 'medium',
+    **kwargs,
+):
+    """Format a date object for display.
+
+    Arguments:
+        dt: The date to format
+        timezone: The timezone to use for the date (defaults to the server timezone)
+        fmt: The strftime format string to use. When provided, takes priority over locale and date_format.
+        locale: Optional locale override (e.g. 'en-us', 'de-de'). Used for locale-aware formatting when no fmt is given.
+        date_format: Babel date format style. One of 'full', 'long', 'medium' (default), 'short'.
+    """
+    check_nulls('format_date', dt)
+
+    try:
+        dt = InvenTree.helpers.to_local_time(dt, timezone).date()
+    except TypeError:
+        return str(dt)
+
+    if fmt:
+        return dt.strftime(fmt)
+
+    return babel_format_date(dt, format=date_format, locale=get_locale(locale))
+
+
+@register.simple_tag()
+def icon(name, **kwargs):
+    """Render an icon from the icon packs.
+
+    Arguments:
+        name: The name of the icon to render
+
+    Keyword Arguments:
+        class: Optional class name(s) to apply to the icon element
+    """
+    if not name:
+        return ''
+
+    try:
+        pack, icon, variant = common.icons.validate_icon(name)
+    except ValidationError:
+        return ''
+
+    unicode = chr(int(icon['variants'][variant], 16))
+    return mark_safe(
+        f'<i class="icon {kwargs.get("class", "")}" style="font-family: inventree-icon-font-{pack.prefix}">{unicode}</i>'
+    )
+
+
+@register.simple_tag()
+def include_icon_fonts(ttf: bool = False, woff: bool = False):
+    """Return the CSS font-face rule for the icon fonts used on the current page (or all)."""
+    fonts = []
+
+    if not ttf and not woff:
+        ttf = woff = True
+
+    for font in common.icons.get_icon_packs().values():
+        # generate the font src string (prefer ttf over woff, woff2 is not supported by weasyprint)
+        if 'truetype' in font.fonts and ttf:
+            font_format, url = 'truetype', font.fonts['truetype']
+        elif 'woff' in font.fonts and woff:
+            font_format, url = 'woff', font.fonts['woff']
+
+        fonts.append(f"""
+@font-face {'{'}
+    font-family: 'inventree-icon-font-{font.prefix}';
+    src: url('{InvenTree.helpers_model.construct_absolute_url(url)}') format('{font_format}');
+{'}'}\n""")
+
+    icon_class = f"""
+.icon {'{'}
+    font-style: normal;
+    font-weight: normal;
+    font-variant: normal;
+    text-transform: none;
+    line-height: 1;
+    /* Better font rendering */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+{'}'}
+    """
+
+    return mark_safe(icon_class + '\n'.join(fonts))
+
+
+@register.simple_tag()
+def lowercase(value: str) -> str:
+    """Convert a string to lowercase.
+
+    Arguments:
+        value: The string to be converted
+    """
+    if not value:
+        return ''
+    return str(value).lower()
+
+
+@register.simple_tag()
+def uppercase(value: str) -> str:
+    """Convert a string to uppercase.
+
+    Arguments:
+        value: The string to be converted
+    """
+    if not value:
+        return ''
+    return str(value).upper()
+
+
+@register.simple_tag()
+def titlecase(value: str) -> str:
+    """Convert a string to title case.
+
+    Arguments:
+        value: The string to be converted
+    """
+    if not value:
+        return ''
+    return str(value).title()
+
+
+@register.simple_tag()
+def strip(value: str, chars: Optional[str] = ' ') -> str:
+    """Strip leading and trailing characters from a string.
+
+    Arguments:
+        value: The string to be stripped
+        chars: The set of characters to strip from the string (default = whitespace)
+    """
+    if not value:
+        return ''
+    return str(value).strip(chars)
+
+
+@register.simple_tag()
+def lstrip(value: str, chars: Optional[str] = ' ') -> str:
+    """Strip leading characters from a string.
+
+    Arguments:
+        value: The string to be stripped
+        chars: The set of characters to strip from the string (default = whitespace)
+    """
+    if not value:
+        return ''
+    return str(value).lstrip(chars)
+
+
+@register.simple_tag()
+def rstrip(value: str, chars: Optional[str] = ' ') -> str:
+    """Strip trailing characters from a string.
+
+    Arguments:
+        value: The string to be stripped
+        chars: The set of characters to strip from the string (default = whitespace)
+    """
+    if not value:
+        return ''
+    return str(value).rstrip(chars)
+
+
+@register.simple_tag()
+def split(value: str, separator: str = ',') -> list:
+    """Split a string into a list, using the provided separator (default = ',').
+
+    Arguments:
+        value: The string to be split
+        separator: The character to use as a separator (default = ',')
+    """
+    if not value:
+        return []
+    return [v.strip() for v in str(value).split(separator)]
+
+
+@register.simple_tag()
+def join(value: list, separator: str = ',') -> str:
+    """Join a list of items into a string, using the provided separator (default = ',').
+
+    Arguments:
+        value: The list of items to be joined
+        separator: The character to use as a separator (default = ',')
+    """
+    if not value:
+        return ''
+    return separator.join(str(v) for v in value)
+
+
+@register.simple_tag()
+def length(value: Any) -> int:
+    """Return the length of a list or string.
+
+    Arguments:
+        value: The value to be measured (e.g. a list or string)
+    """
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+@register.simple_tag()
+def replace(value: str, old: str, new: str = '') -> str:
+    """Replace occurrences of a substring within a string with a new value.
+
+    Arguments:
+        value: The original string
+        old: The substring to be replaced
+        new: The value to replace the old substring with (default = "")
+    """
+    if not value:
+        return ''
+    return str(value).replace(old, new)
+
+
+@register.simple_tag()
+def first(value: list, default: Any = None) -> Any:
+    """Return the first item in a list, or a default value if the list is empty.
+
+    Arguments:
+        value: The list from which to retrieve the first item
+        default: The value to return if the list is empty (default = None)
+    """
+    if not value:
+        return default
+    try:
+        return value[0]
+    except (IndexError, TypeError):
+        return default
+
+
+@register.simple_tag()
+def last(value: list, default: Any = None) -> Any:
+    """Return the last item in a list, or a default value if the list is empty.
+
+    Arguments:
+        value: The list from which to retrieve the last item
+        default: The value to return if the list is empty (default = None)
+    """
+    if not value:
+        return default
+    try:
+        return value[-1]
+    except (IndexError, TypeError):
+        return default
+
+
+@register.simple_tag()
+def reverse(value: list) -> list:
+    """Return a reversed version of the provided list.
+
+    Arguments:
+        value: The list to be reversed
+    """
+    if not value:
+        return []
+    try:
+        return value[::-1]
+    except TypeError:
+        return []
+
+
+@register.simple_tag()
+def truncate(value: list, length: int) -> list:
+    """Return a truncated version of the provided list.
+
+    Arguments:
+        value: The list to be truncated
+        length: The maximum length of the returned list
+    """
+    if not value:
+        return []
+    try:
+        return value[:length]
+    except TypeError:
+        return []

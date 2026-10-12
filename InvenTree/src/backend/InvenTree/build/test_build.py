@@ -1,0 +1,2176 @@
+"""Unit tests for the 'build' models."""
+
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+from django.core.exceptions import ValidationError
+from django.db import connection, transaction
+from django.db.models import Sum
+from django.test import TransactionTestCase, skipUnlessDBFeature
+from django.test.utils import override_settings
+from django.urls import reverse
+
+import structlog
+
+import build.tasks
+import common.models
+import company.models
+from build.models import Build, BuildItem, BuildLine, generate_next_build_reference
+from build.status_codes import BuildStatus
+from common.settings import set_global_setting
+from InvenTree import status_codes as status
+from InvenTree.unit_test import (
+    InvenTreeAPITestCase,
+    InvenTreeTestCase,
+    findOffloadedEvent,
+)
+from order.models import PurchaseOrder, PurchaseOrderLineItem
+from part.models import BomItem, BomItemSubstitute, Part, PartTestTemplate
+from stock.models import (
+    StockItem,
+    StockItemTestResult,
+    StockItemTracking,
+    StockLocation,
+)
+from stock.status_codes import StockStatus
+from users.models import Owner
+
+logger = structlog.get_logger('inventree')
+
+
+class BuildTestBase(InvenTreeTestCase):
+    """Run some tests to ensure that the Build model is working properly."""
+
+    fixtures = ['users']
+
+    @classmethod
+    def setUpTestData(cls):
+        """Initialize data to use for these tests.
+
+        The base Part 'assembly' has a BOM consisting of three parts:
+
+        - 5 x sub_part_1
+        - 3 x sub_part_2
+        - 2 x sub_part_3 (trackable)
+
+        We will build 10x 'assembly' parts, in two build outputs:
+
+        - 3 x output_1
+        - 7 x output_2
+
+        """
+        super().setUpTestData()
+
+        # Create a base "Part"
+        cls.assembly = Part.objects.create(
+            name='An assembled part',
+            description='Why does it matter what my description is?',
+            assembly=True,
+            trackable=True,
+            testable=True,
+        )
+
+        # create one build with one required test template
+        cls.tested_part_with_required_test = Part.objects.create(
+            name='Part having required tests',
+            description='Why does it matter what my description is?',
+            assembly=True,
+            trackable=True,
+            testable=True,
+        )
+
+        cls.test_template_required = PartTestTemplate.objects.create(
+            part=cls.tested_part_with_required_test,
+            test_name='Required test',
+            description='Required test template description',
+            required=True,
+            requires_value=False,
+            requires_attachment=False,
+        )
+
+        ref = generate_next_build_reference()
+
+        cls.build_w_tests_trackable = Build.objects.create(
+            reference=ref,
+            title='This is a build',
+            part=cls.tested_part_with_required_test,
+            quantity=1,
+            issued_by=get_user_model().objects.get(pk=1),
+        )
+
+        cls.stockitem_with_required_test = StockItem.objects.create(
+            part=cls.tested_part_with_required_test,
+            quantity=1,
+            is_building=True,
+            serial=uuid.uuid4(),
+            build=cls.build_w_tests_trackable,
+        )
+
+        # now create a part with a non-required test template
+        cls.tested_part_wo_required_test = Part.objects.create(
+            name='Part with one non.required test',
+            description='Why does it matter what my description is?',
+            assembly=True,
+            trackable=True,
+            testable=True,
+        )
+
+        cls.test_template_non_required = PartTestTemplate.objects.create(
+            part=cls.tested_part_wo_required_test,
+            test_name='Required test template',
+            description='Required test template description',
+            required=False,
+            requires_value=False,
+            requires_attachment=False,
+        )
+
+        ref = generate_next_build_reference()
+
+        cls.build_wo_tests_trackable = Build.objects.create(
+            reference=ref,
+            title='This is a build',
+            part=cls.tested_part_wo_required_test,
+            quantity=1,
+            issued_by=get_user_model().objects.get(pk=1),
+        )
+
+        cls.stockitem_wo_required_test = StockItem.objects.create(
+            part=cls.tested_part_wo_required_test,
+            quantity=1,
+            is_building=True,
+            serial=uuid.uuid4(),
+            build=cls.build_wo_tests_trackable,
+        )
+
+        cls.sub_part_1 = Part.objects.create(
+            name='Widget A', description='A widget', component=True
+        )
+
+        cls.sub_part_2 = Part.objects.create(
+            name='Widget B', description='A widget', component=True
+        )
+
+        cls.sub_part_3 = Part.objects.create(
+            name='Widget C', description='A widget', component=True, trackable=True
+        )
+
+        # Create BOM item links for the parts
+        cls.bom_item_1 = BomItem.objects.create(
+            part=cls.assembly, sub_part=cls.sub_part_1, quantity=5
+        )
+
+        cls.bom_item_2 = BomItem.objects.create(
+            part=cls.assembly, sub_part=cls.sub_part_2, quantity=3, optional=True
+        )
+
+        # sub_part_3 is trackable!
+        cls.bom_item_3 = BomItem.objects.create(
+            part=cls.assembly, sub_part=cls.sub_part_3, quantity=2
+        )
+
+        ref = generate_next_build_reference()
+
+        # Create a "Build" object to make 10x objects
+        cls.build = Build.objects.create(
+            reference=ref,
+            title='This is a build',
+            part=cls.assembly,
+            quantity=10,
+            issued_by=get_user_model().objects.get(pk=1),
+            status=BuildStatus.PENDING,
+        )
+
+        # Create some BuildLine items we can use later on
+        cls.line_1 = BuildLine.objects.get(build=cls.build, bom_item=cls.bom_item_1)
+        cls.line_2 = BuildLine.objects.get(build=cls.build, bom_item=cls.bom_item_2)
+        cls.line_3 = BuildLine.objects.get(build=cls.build, bom_item=cls.bom_item_3)
+
+        # Create some build output (StockItem) objects
+        cls.output_1 = StockItem.objects.create(
+            part=cls.assembly, quantity=3, is_building=True, build=cls.build
+        )
+
+        cls.output_2 = StockItem.objects.create(
+            part=cls.assembly, quantity=7, is_building=True, build=cls.build
+        )
+
+        # Create some stock items to assign to the build
+        cls.stock_1_1 = StockItem.objects.create(part=cls.sub_part_1, quantity=3)
+        cls.stock_1_2 = StockItem.objects.create(part=cls.sub_part_1, quantity=100)
+
+        cls.stock_2_1 = StockItem.objects.create(part=cls.sub_part_2, quantity=5)
+        cls.stock_2_2 = StockItem.objects.create(part=cls.sub_part_2, quantity=5)
+        cls.stock_2_3 = StockItem.objects.create(part=cls.sub_part_2, quantity=5)
+        cls.stock_2_4 = StockItem.objects.create(part=cls.sub_part_2, quantity=5)
+        cls.stock_2_5 = StockItem.objects.create(part=cls.sub_part_2, quantity=5)
+
+        cls.stock_3_1 = StockItem.objects.create(part=cls.sub_part_3, quantity=1000)
+
+
+class BuildTest(BuildTestBase):
+    """Unit testing class for the Build model."""
+
+    def test_ref_int(self):
+        """Test the "integer reference" field used for natural sorting."""
+        # Set build reference to new value
+        set_global_setting(
+            'BUILDORDER_REFERENCE_PATTERN', 'BO-{ref}-???', change_user=None
+        )
+
+        refs = {
+            'BO-123-456': 123,
+            'BO-456-123': 456,
+            'BO-999-ABC': 999,
+            'BO-123ABC-ABC': 123,
+            'BO-ABC123-ABC': 123,
+        }
+
+        for ref, ref_int in refs.items():
+            build = Build(
+                reference=ref, quantity=1, part=self.assembly, title='Making some parts'
+            )
+
+            self.assertEqual(build.reference_int, 0)
+            build.save()
+            self.assertEqual(build.reference_int, ref_int)
+
+        # Set build reference back to default value
+        set_global_setting(
+            'BUILDORDER_REFERENCE_PATTERN',
+            'BO-{ref:04d}',  # noqa: RUF027
+            change_user=None,
+        )
+
+    def test_ref_validation(self):
+        """Test that the reference field validation works as expected."""
+        # Default reference pattern = 'BO-{ref:04d}
+        # These patterns should fail
+        for ref in ['BO-1234x', 'BO1234', 'OB-1234', 'BO--1234']:
+            with self.assertRaises(ValidationError):
+                Build.objects.create(
+                    part=self.assembly,
+                    quantity=10,
+                    reference=ref,
+                    title='Invalid reference',
+                )
+
+        for ref in ['BO-1234', 'BO-9999', 'BO-123']:
+            Build.objects.create(
+                part=self.assembly, quantity=10, reference=ref, title='Valid reference'
+            )
+
+        # Try a new validator pattern
+        set_global_setting('BUILDORDER_REFERENCE_PATTERN', '{ref}-BO', change_user=None)  # noqa: RUF027
+
+        for ref in ['1234-BO', '9999-BO']:
+            Build.objects.create(
+                part=self.assembly, quantity=10, reference=ref, title='Valid reference'
+            )
+
+        # Set build reference back to default value
+        set_global_setting(
+            'BUILDORDER_REFERENCE_PATTERN',
+            'BO-{ref:04d}',  # noqa: RUF027
+            change_user=None,
+        )
+
+    def test_next_ref(self):
+        """Test that the next reference is automatically generated."""
+        set_global_setting(
+            'BUILDORDER_REFERENCE_PATTERN', 'XYZ-{ref:06d}', change_user=None
+        )
+
+        build = Build.objects.create(
+            part=self.assembly, quantity=5, reference='XYZ-987', title='Some thing'
+        )
+
+        self.assertEqual(build.reference_int, 987)
+
+        # Now create one *without* specifying the reference
+        build = Build.objects.create(
+            part=self.assembly, quantity=1, title='Some new title'
+        )
+
+        self.assertEqual(build.reference, 'XYZ-000988')
+        self.assertEqual(build.reference_int, 988)
+
+        # Set build reference back to default value
+        set_global_setting(
+            'BUILDORDER_REFERENCE_PATTERN', 'BO-{ref:04d}', change_user=None
+        )
+
+    def test_init(self):
+        """Perform some basic tests before we start the ball rolling."""
+        self.assertEqual(StockItem.objects.count(), 12)
+
+        # Build is PENDING
+        self.assertEqual(self.build.status, status.BuildStatus.PENDING)
+
+        self.assertTrue(self.build.is_active)
+        self.assertTrue(self.build.can_hold)
+        self.assertTrue(self.build.can_issue)
+
+        # Build has two build outputs
+        self.assertEqual(self.build.output_count, 2)
+
+        # None of the build outputs have been completed
+        for output in self.build.get_build_outputs().all():
+            self.assertFalse(self.build.is_fully_allocated(output))
+
+        self.assertFalse(self.line_1.is_fully_allocated())
+        self.assertFalse(self.line_2.is_overallocated())
+
+        self.assertEqual(self.line_1.allocated_quantity(), 0)
+
+        self.assertFalse(self.build.is_complete)
+
+    def test_build_item_clean(self):
+        """Ensure that dodgy BuildItem objects cannot be created."""
+        stock = StockItem.objects.create(part=self.assembly, quantity=99)
+
+        # Create a BuiltItem which points to an invalid StockItem
+        b = BuildItem(stock_item=stock, build_line=self.line_2, quantity=10)
+
+        with self.assertRaises(ValidationError):
+            b.save()
+
+        # Create a BuildItem which has too much stock assigned
+        b = BuildItem(
+            stock_item=self.stock_1_1, build_line=self.line_1, quantity=9999999
+        )
+
+        with self.assertRaises(ValidationError):
+            b.clean()
+
+        # Negative stock? Not on my watch!
+        b = BuildItem(stock_item=self.stock_1_1, build_line=self.line_1, quantity=-99)
+
+        with self.assertRaises(ValidationError):
+            b.clean()
+
+        # Ok, what about we make one that does *not* fail?
+        b = BuildItem(
+            stock_item=self.stock_1_2,
+            build_line=self.line_1,
+            install_into=self.output_1,
+            quantity=10,
+        )
+        b.save()
+
+    def test_duplicate_bom_line(self):
+        """Try to add a duplicate BOM item - it should be allowed."""
+        BomItem.objects.create(
+            part=self.assembly, sub_part=self.sub_part_1, quantity=99
+        )
+
+    def allocate_stock(self, output, allocations):
+        """Allocate stock to this build, against a particular output.
+
+        Args:
+            output: StockItem object (or None)
+            allocations: Map of {StockItem: quantity}
+        """
+        items_to_create = []
+
+        for item, quantity in allocations.items():
+            # Find an appropriate BuildLine to allocate against
+            line = BuildLine.objects.filter(
+                build=self.build, bom_item__sub_part=item.part
+            ).first()
+
+            items_to_create.append(
+                BuildItem(
+                    build_line=line,
+                    stock_item=item,
+                    quantity=quantity,
+                    install_into=output,
+                )
+            )
+
+        BuildItem.objects.bulk_create(items_to_create)
+
+    def test_partial_allocation(self):
+        """Test partial allocation of stock."""
+        # Fully allocate tracked stock against build output 1
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+
+        self.assertTrue(self.build.is_output_fully_allocated(self.output_1))
+
+        # Partially allocate tracked stock against build output 2
+        self.allocate_stock(self.output_2, {self.stock_3_1: 1})
+
+        self.assertFalse(self.build.is_output_fully_allocated(self.output_2))
+
+        # Partially allocate untracked stock against build
+        self.allocate_stock(None, {self.stock_1_1: 1, self.stock_2_1: 1})
+
+        self.assertFalse(self.build.is_output_fully_allocated(None))
+
+        # Find lines which are *not* fully allocated
+        unallocated = self.build.unallocated_lines()
+
+        self.assertEqual(len(unallocated), 3)
+
+        self.allocate_stock(None, {self.stock_1_2: 100})
+
+        self.assertFalse(self.build.is_fully_allocated(None))
+
+        unallocated = self.build.unallocated_lines()
+
+        self.assertEqual(len(unallocated), 2)
+
+        self.build.deallocate_stock()
+
+        unallocated = self.build.unallocated_lines(None)
+
+        self.assertEqual(len(unallocated), 3)
+
+        self.assertFalse(self.build.is_fully_allocated(tracked=False))
+
+        self.stock_2_1.quantity = 500
+        self.stock_2_1.save()
+
+        # Now we "fully" allocate the untracked untracked items
+        self.allocate_stock(None, {self.stock_1_2: 50, self.stock_2_1: 50})
+
+        self.assertTrue(self.build.is_fully_allocated(tracked=False))
+
+    def test_overallocation_and_trim(self):
+        """Test overallocation of stock and trim function."""
+        self.assertEqual(self.build.status, status.BuildStatus.PENDING)
+        self.build.issue_build()
+        self.assertEqual(self.build.status, status.BuildStatus.PRODUCTION)
+
+        # Fully allocate tracked stock (not eligible for trimming)
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+        self.allocate_stock(self.output_2, {self.stock_3_1: 14})
+        # Fully allocate part 1 (should be left alone)
+        self.allocate_stock(None, {self.stock_1_1: 3, self.stock_1_2: 47})
+
+        extra_2_1 = StockItem.objects.create(part=self.sub_part_2, quantity=6)
+        extra_2_2 = StockItem.objects.create(part=self.sub_part_2, quantity=4)
+
+        # Overallocate part 2 (30 needed)
+        self.allocate_stock(
+            None,
+            {
+                self.stock_2_1: 5,
+                self.stock_2_2: 5,
+                self.stock_2_3: 5,
+                self.stock_2_4: 5,
+                self.stock_2_5: 5,  # 25
+                extra_2_1: 6,  # 31
+                extra_2_2: 4,  # 35
+            },
+        )
+
+        self.assertTrue(self.build.is_overallocated())
+
+        self.build.trim_allocated_stock()
+        self.assertFalse(self.build.is_overallocated())
+
+        self.build.complete_build_output(self.output_1, None)
+        self.build.complete_build_output(self.output_2, None)
+
+        self.assertTrue(self.build.can_complete)
+
+        n = StockItem.objects.filter(consumed_by=self.build).count()
+
+        self.build.complete_build(None)
+
+        # The status is updated by the (synchronous, in tests) background task
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.status, status.BuildStatus.COMPLETE)
+
+        # Check stock items are in expected state.
+        self.assertEqual(StockItem.objects.get(pk=self.stock_1_2.pk).quantity, 53)
+
+        # Total stock quantity has not been decreased
+        items = StockItem.objects.filter(part=self.sub_part_2)
+        self.assertEqual(items.aggregate(Sum('quantity'))['quantity__sum'], 35)
+
+        # However, the "available" stock quantity has been decreased
+        self.assertEqual(
+            items.filter(consumed_by=None).aggregate(Sum('quantity'))['quantity__sum'],
+            5,
+        )
+
+        # And the "consumed_by" quantity has been increased
+        self.assertEqual(
+            items.filter(consumed_by=self.build).aggregate(Sum('quantity'))[
+                'quantity__sum'
+            ],
+            30,
+        )
+
+        self.assertEqual(StockItem.objects.get(pk=self.stock_3_1.pk).quantity, 980)
+
+        # Check that the "consumed_by" item count has increased
+        consumed_items = StockItem.objects.filter(consumed_by=self.build)
+        self.assertEqual(consumed_items.count(), n + 8)
+
+        # Finally, return the items into stock
+        location = StockLocation.objects.filter(structural=False).first()
+
+        for item in consumed_items:
+            item.return_to_stock(location)
+
+        # No consumed items should remain
+        self.assertEqual(StockItem.objects.filter(consumed_by=self.build).count(), 0)
+
+    def test_return_consumed(self):
+        """Test returning consumed stock items to stock."""
+        self.build.auto_allocate_stock(interchangeable=True)
+
+        self.build.incomplete_outputs.delete()
+
+        self.assertGreater(self.build.allocated_stock.count(), 0)
+
+        self.build.complete_build(self.user)
+        consumed_items = StockItem.objects.filter(consumed_by=self.build)
+        self.assertGreater(consumed_items.count(), 0)
+
+        location = StockLocation.objects.filter(structural=False).last()
+
+        # Return a partial quantity of each item to stock
+        for item in consumed_items:
+            q = item.quantity
+            self.assertGreater(item.quantity, 1)
+            item.return_to_stock(location, merge=False, quantity=1)
+            item.refresh_from_db()
+            self.assertEqual(item.quantity, q - 1)
+            self.assertEqual(item.children.count(), 1)
+            self.assertFalse(item.is_in_stock())
+            child = item.children.first()
+            self.assertTrue(child.is_in_stock())
+
+    def test_change_part(self):
+        """Try to change target part after creating a build."""
+        bo = Build.objects.create(
+            reference='BO-9999',
+            title='Some new build',
+            part=self.assembly,
+            quantity=5,
+            issued_by=get_user_model().objects.get(pk=1),
+        )
+
+        assembly_2 = Part.objects.create(
+            name='Another assembly', description='A different assembly', assembly=True
+        )
+
+        # Should not be able to change the part after the Build is saved
+        with self.assertRaises(ValidationError):
+            bo.part = assembly_2
+            bo.clean()
+
+    def test_cancel(self):
+        """Test build cancellation: status is updated and allocations are removed by default."""
+        self.build.issue_build()
+
+        self.allocate_stock(None, {self.stock_1_2: 50})
+        self.assertGreater(self.build.allocated_stock.count(), 0)
+
+        initial_output_count = self.build.build_outputs.filter(is_building=True).count()
+        self.assertGreater(initial_output_count, 0)
+
+        self.build.cancel_build(None)
+        self.build.refresh_from_db()
+
+        self.assertEqual(self.build.status, BuildStatus.CANCELLED)
+
+        # Allocations removed (but stock not consumed) by default
+        self.assertEqual(self.build.allocated_stock.count(), 0)
+        self.assertIsNone(StockItem.objects.get(pk=self.stock_1_2.pk).consumed_by)
+
+        # Incomplete outputs preserved by default (remove_incomplete_outputs=False)
+        self.assertEqual(
+            self.build.build_outputs.filter(is_building=True).count(),
+            initial_output_count,
+        )
+
+    def test_cancel_stale_instance_is_noop(self):
+        """A second cancellation attempt with a stale build instance must be a no-op.
+
+        Regression test: _action_cancel() offloaded the cancellation task
+        unconditionally, using no idempotency check at all, so two concurrent
+        cancellation requests (each holding its own instance of the build) could
+        both offload the cancellation task (duplicate events and notifications).
+        The status is now re-read (under lock) from the database, and a build
+        which is already cancelled is skipped.
+        """
+        self.build.issue_build()
+        self.allocate_stock(None, {self.stock_1_2: 50})
+
+        # Two "concurrent" requests each hold their own instance of the build
+        build_a = Build.objects.get(pk=self.build.pk)
+        build_b = Build.objects.get(pk=self.build.pk)
+
+        build_a.cancel_build(None)
+
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.status, status.BuildStatus.CANCELLED)
+
+        # The second (stale) instance still believes the build is in production -
+        # cancellation must be skipped based on the database state
+        self.assertEqual(build_b.status, status.BuildStatus.PRODUCTION)
+
+        with mock.patch('build.models.trigger_event') as trigger:
+            build_b.cancel_build(None)
+            trigger.assert_not_called()
+
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.status, status.BuildStatus.CANCELLED)
+
+    def test_complete(self):
+        """Test completion of a build output."""
+        self.stock_1_1.quantity = 1000
+        self.stock_1_1.save()
+
+        self.stock_2_1.quantity = 30
+        self.stock_2_1.save()
+
+        self.build.issue_build()
+
+        # Allocate non-tracked parts
+        self.allocate_stock(
+            None,
+            {
+                self.stock_1_1: self.stock_1_1.quantity,  # Allocate *all* stock from this item
+                self.stock_1_2: 10,
+                self.stock_2_1: 30,
+            },
+        )
+
+        # Allocate tracked parts to output_1
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+
+        # Allocate tracked parts to output_2
+        self.allocate_stock(self.output_2, {self.stock_3_1: 14})
+
+        self.assertTrue(self.build.is_fully_allocated(None))
+        self.assertTrue(self.build.is_fully_allocated(self.output_1))
+        self.assertTrue(self.build.is_fully_allocated(self.output_2))
+
+        self.build.complete_build_output(self.output_1, None)
+
+        self.assertFalse(self.build.can_complete)
+
+        self.build.complete_build_output(self.output_2, None)
+
+        self.assertTrue(self.build.can_complete)
+
+        self.build.complete_build(None)
+
+        # The status is updated by the (synchronous, in tests) background task
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.status, status.BuildStatus.COMPLETE)
+
+        # the original BuildItem objects should have been deleted!
+        self.assertEqual(BuildItem.objects.count(), 0)
+
+        # New stock items should have been created!
+        self.assertEqual(StockItem.objects.count(), 15)
+
+        # This stock item has been marked as "consumed"
+        item = StockItem.objects.get(pk=self.stock_1_1.pk)
+        self.assertIsNotNone(item.consumed_by)
+        self.assertFalse(item.in_stock)
+
+        # And 10 new stock items created for the build output
+        outputs = StockItem.objects.filter(build=self.build)
+
+        self.assertEqual(outputs.count(), 2)
+
+        for output in outputs:
+            self.assertFalse(output.is_building)
+
+    def test_complete_output_stale_build_instance(self):
+        """The 'completed' count is incremented atomically at the database level.
+
+        Simulates two concurrent processes completing different outputs of the
+        same build, each holding its own (stale) copy of the Build instance.
+        """
+        self.stock_1_1.quantity = 1000
+        self.stock_1_1.save()
+
+        self.stock_2_1.quantity = 30
+        self.stock_2_1.save()
+
+        self.build.issue_build()
+
+        # Allocate non-tracked parts
+        self.allocate_stock(
+            None,
+            {
+                self.stock_1_1: self.stock_1_1.quantity,
+                self.stock_1_2: 10,
+                self.stock_2_1: 30,
+            },
+        )
+
+        # Allocate tracked parts against each output
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+        self.allocate_stock(self.output_2, {self.stock_3_1: 14})
+
+        # Two independent in-memory copies of the same build
+        build_a = Build.objects.get(pk=self.build.pk)
+        build_b = Build.objects.get(pk=self.build.pk)
+
+        build_a.complete_build_output(self.output_1, None)
+        build_b.complete_build_output(self.output_2, None)
+
+        # Both completions must be counted
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.completed, 10)
+
+    def test_complete_allocations_sums_consumed(self):
+        """Completing multiple allocations against one BuildLine sums the consumed count.
+
+        (Concurrent completions are serialized by the Build row lock inside
+        complete_allocations, so only the sequential arithmetic is tested here.)
+        """
+        self.build.issue_build()
+
+        self.allocate_stock(None, {self.stock_1_1: 3, self.stock_1_2: 5})
+
+        self.build.complete_allocations(
+            BuildItem.objects.filter(build_line=self.line_1), user=self.user
+        )
+
+        # Both consumed quantities must be counted
+        self.line_1.refresh_from_db()
+        self.assertEqual(self.line_1.consumed, 8)
+
+    def test_complete_allocation_wrapper(self):
+        """BuildItem.complete_allocation() is a thin wrapper around Build.complete_allocations().
+
+        Regression test: complete_allocation() was removed when complete_allocations() was
+        introduced, but some call sites still complete a single BuildItem at a time.
+        """
+        self.build.issue_build()
+
+        self.allocate_stock(None, {self.stock_1_1: 3})
+        alloc = BuildItem.objects.get(build_line=self.line_1, stock_item=self.stock_1_1)
+
+        alloc.complete_allocation(user=self.user)
+
+        self.stock_1_1.refresh_from_db()
+        self.line_1.refresh_from_db()
+
+        self.assertEqual(self.stock_1_1.consumed_by, self.build)
+        self.assertEqual(self.line_1.consumed, 3)
+        self.assertFalse(BuildItem.objects.filter(pk=alloc.pk).exists())
+
+    def test_complete_zero_quantity_allocation(self):
+        """A zero-quantity allocation is skipped cleanly on completion.
+
+        Regression test: completing a BuildItem with quantity=0 (permitted by
+        the model validators) crashed, blocking build completion until the
+        empty allocation was manually removed.
+        """
+        self.build.issue_build()
+
+        # An allocation with zero quantity, against an item with stock available
+        alloc = BuildItem.objects.create(
+            build_line=self.line_1, stock_item=self.stock_1_2, quantity=0
+        )
+
+        n_items = StockItem.objects.count()
+
+        # Completing the allocation must not crash, and performs no stock operations
+        self.build.complete_allocations(
+            BuildItem.objects.filter(pk=alloc.pk), user=self.user
+        )
+
+        self.assertEqual(StockItem.objects.count(), n_items)
+
+        self.stock_1_2.refresh_from_db()
+        self.assertEqual(self.stock_1_2.quantity, 100)
+        self.assertIsNone(self.stock_1_2.consumed_by)
+
+        self.line_1.refresh_from_db()
+        self.assertEqual(self.line_1.consumed, 0)
+
+        alloc.delete()
+
+        # An allocation whose stock item has been depleted elsewhere
+        # is also skipped cleanly (allocated quantity clamps to zero)
+        depleted = StockItem.objects.create(
+            part=self.sub_part_1, quantity=5, delete_on_deplete=False
+        )
+        alloc = BuildItem.objects.create(
+            build_line=self.line_1, stock_item=depleted, quantity=5
+        )
+
+        depleted.take_stock(5, self.user)
+        depleted.refresh_from_db()
+        self.assertEqual(depleted.quantity, 0)
+
+        self.build.complete_allocations(
+            BuildItem.objects.filter(pk=alloc.pk), user=self.user
+        )
+
+        depleted.refresh_from_db()
+        self.assertIsNone(depleted.consumed_by)
+
+        self.line_1.refresh_from_db()
+        self.assertEqual(self.line_1.consumed, 0)
+
+    def test_complete_allocation_stale_item_instance(self):
+        """complete_allocation() must not clamp/split using a stale stock_item.quantity.
+
+        Regression test: the allocated quantity was clamped, and the choice between
+        consuming the item directly versus splitting off a portion of it, was made
+        using self.stock_item.quantity as cached in memory on the BuildItem. If a
+        concurrent operation reduced the stock item's quantity after the BuildItem
+        was loaded, the stale value could select the "split" branch when only the
+        entire (now-reduced) item is actually available - causing splitStock() to
+        reject the now-oversized split. The stock item's row is now locked and its
+        quantity refreshed before the clamp/split decision is made.
+        """
+        self.build.issue_build()
+
+        # A partial allocation - less than the full stock item quantity
+        alloc = BuildItem.objects.create(
+            build_line=self.line_1, stock_item=self.stock_1_2, quantity=60
+        )
+
+        # Load a second copy of the allocation, caching the stock item's original quantity
+        stale_alloc = BuildItem.objects.get(pk=alloc.pk)
+        self.assertEqual(stale_alloc.stock_item.quantity, 100)
+
+        # Reduce the available stock *after* the stale copy was loaded
+        # (simulating a concurrent stock adjustment elsewhere)
+        self.stock_1_2.quantity = 40
+        self.stock_1_2.save()
+
+        # Completing the (stale) allocation must not raise, and must consume only
+        # the quantity which is actually available
+        stale_alloc.complete_allocation(user=self.user)
+
+        self.stock_1_2.refresh_from_db()
+        self.line_1.refresh_from_db()
+
+        # The entire (now-reduced) item is consumed directly - no split occurs
+        self.assertEqual(self.stock_1_2.quantity, 40)
+        self.assertEqual(self.stock_1_2.consumed_by, self.build)
+        self.assertEqual(self.line_1.consumed, 40)
+
+    def test_complete_with_required_tests(self):
+        """Test the prevention completion when a required test is missing feature."""
+        # with required tests incompleted the save should fail
+        set_global_setting(
+            'PREVENT_BUILD_COMPLETION_HAVING_INCOMPLETED_TESTS', True, change_user=None
+        )
+
+        with self.assertRaises(ValidationError) as exc:
+            self.build_w_tests_trackable.complete_build_output(
+                self.stockitem_with_required_test, None
+            )
+
+        self.assertIn(
+            'Build output has not passed all required tests', str(exc.exception)
+        )
+
+        # let's complete the required test and see if it could be saved
+        StockItemTestResult.objects.create(
+            stock_item=self.stockitem_with_required_test,
+            template=self.test_template_required,
+            result=True,
+        )
+
+        self.build_w_tests_trackable.complete_build_output(
+            self.stockitem_with_required_test, None
+        )
+
+        # let's see if a non required test could be saved
+        self.build_wo_tests_trackable.complete_build_output(
+            self.stockitem_wo_required_test, None
+        )
+
+    def test_complete_output_still_in_production(self):
+        """Test that a build output cannot be completed if allocated stock is still in production."""
+        # Create a stock item of the tracked sub-part, which is itself still "in production"
+        sub_build = Build.objects.create(
+            reference=generate_next_build_reference(),
+            title='Building a sub-part',
+            part=self.sub_part_3,
+            quantity=2,
+            issued_by=get_user_model().objects.get(pk=1),
+        )
+
+        in_production = StockItem.objects.create(
+            part=self.sub_part_3, quantity=2, is_building=True, build=sub_build
+        )
+
+        self.allocate_stock(self.output_1, {in_production: 2})
+
+        with self.assertRaises(ValidationError) as exc:
+            self.build.complete_build_output(self.output_1, None)
+
+        self.assertIn(
+            'Allocated stock items are still in production', str(exc.exception)
+        )
+
+    def test_partial_complete_with_allocated_items(self):
+        """Test that a build output with tracked allocations cannot be partially completed."""
+        # Allocate tracked stock against output_1 (quantity=3)
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+
+        with self.assertRaises(ValidationError) as exc:
+            self.build.complete_build_output(self.output_1, None, quantity=1)
+
+        self.assertIn(
+            'Cannot partially complete a build output with allocated items',
+            str(exc.exception),
+        )
+
+    def test_complete_output_invalid_quantity(self):
+        """Test that invalid quantities are rejected when completing a build output directly."""
+        with self.assertRaises(ValidationError) as exc:
+            self.build.complete_build_output(self.output_1, None, quantity=0)
+
+        self.assertIn('Quantity must be greater than zero', str(exc.exception))
+
+        with self.assertRaises(ValidationError) as exc:
+            self.build.complete_build_output(
+                self.output_1, None, quantity=self.output_1.quantity + 1
+            )
+
+        self.assertIn(
+            'Quantity cannot be greater than the output quantity', str(exc.exception)
+        )
+
+    def test_overdue_notification(self):
+        """Test sending of notifications when a build order is overdue."""
+        self.ensurePluginsLoaded()
+
+        self.build.target_date = datetime.now().date() - timedelta(days=1)
+        self.build.save()
+
+        # Check for overdue orders
+        build.tasks.check_overdue_build_orders()
+
+        message = common.models.NotificationMessage.objects.get(
+            category='build.overdue_build_order', user__id=1
+        )
+
+        self.assertEqual(message.name, 'Overdue Build Order')
+
+    def test_new_build_notification(self):
+        """Test that a notification is sent when a new build is created."""
+        Build.objects.create(
+            reference='BO-9999',
+            title='Some new build',
+            part=self.assembly,
+            quantity=5,
+            issued_by=get_user_model().objects.get(pk=2),
+            responsible=Owner.create(obj=Group.objects.get(pk=3)),
+        )
+
+        # Two notifications should have been sent
+        messages = common.models.NotificationMessage.objects.filter(
+            category='build.new_build'
+        )
+
+        self.assertEqual(messages.count(), 1)
+
+        self.assertFalse(messages.filter(user__pk=2).exists())
+
+        # Inactive users do not receive notifications
+        self.assertFalse(messages.filter(user__pk=3).exists())
+
+        self.assertTrue(messages.filter(user__pk=4).exists())
+
+    @override_settings(
+        TESTING_TABLE_EVENTS=True,
+        PLUGIN_TESTING_EVENTS=True,
+        PLUGIN_TESTING_EVENTS_ASYNC=True,
+    )
+    def test_events(self):
+        """Test that build events are triggered correctly."""
+        from django_q.models import OrmQ
+
+        from build.events import BuildEvents
+
+        set_global_setting('ENABLE_PLUGINS_EVENTS', True)
+
+        OrmQ.objects.all().delete()
+
+        # Create a new build
+        build = Build.objects.create(
+            reference='BO-9999',
+            title='Some new build',
+            part=self.assembly,
+            quantity=5,
+            issued_by=get_user_model().objects.get(pk=2),
+            responsible=Owner.create(obj=Group.objects.get(pk=3)),
+        )
+
+        # Check that the 'build.created' event was triggered
+        task = findOffloadedEvent(
+            'build_build.created',
+            matching_kwargs=['id', 'model'],
+            reverse=True,
+            clear_after=True,
+        )
+
+        # Assert that the task was found
+        self.assertIsNotNone(task)
+
+        # Check that the Build ID matches
+        self.assertEqual(task.kwargs()['id'], build.pk)
+
+        # Issue the build
+        build.issue_build()
+
+        # Check that the 'build.issued' event was triggered
+        task = findOffloadedEvent(
+            BuildEvents.ISSUED, matching_kwargs=['id'], clear_after=True
+        )
+
+        self.assertIsNotNone(task)
+
+        set_global_setting('ENABLE_PLUGINS_EVENTS', False)
+
+    def test_metadata(self):
+        """Unit tests for the metadata field."""
+        # Make sure a BuildItem exists before trying to run this test
+        b = BuildItem(
+            stock_item=self.stock_1_2,
+            build_line=self.line_1,
+            install_into=self.output_1,
+            quantity=10,
+        )
+        b.save()
+
+        for model in [Build, BuildItem]:
+            p = model.objects.first()
+            self.assertEqual(len(p.metadata.keys()), 0)
+
+            self.assertIsNone(p.get_metadata('test'))
+            self.assertEqual(p.get_metadata('test', backup_value=123), 123)
+
+            # Test update via the set_metadata() method
+            p.set_metadata('test', 3)
+            self.assertEqual(p.get_metadata('test'), 3)
+
+            for k in ['apple', 'banana', 'carrot', 'carrot', 'banana']:
+                p.set_metadata(k, k)
+
+            self.assertEqual(len(p.metadata.keys()), 4)
+
+
+class AutoAllocationTests(BuildTestBase):
+    """Tests for auto allocating stock against a build order."""
+
+    def setUp(self):
+        """Init routines for this unit test class."""
+        super().setUp()
+
+        # Add a "substitute" part for bom_item_2
+        alt_part = Part.objects.create(
+            name='alt part', description='An alternative part!', component=True
+        )
+
+        BomItemSubstitute.objects.create(bom_item=self.bom_item_2, part=alt_part)
+
+        StockItem.objects.create(part=alt_part, quantity=500)
+
+    def test_auto_allocate(self):
+        """Run the 'auto-allocate' function. What do we expect to happen?
+
+        There are two "untracked" parts:
+            - sub_part_1 (quantity 5 per BOM = 50 required total) / 103 in stock (2 items)
+            - sub_part_2 (quantity 3 per BOM = 30 required total) / 25 in stock (5 items)
+
+        A "fully auto" allocation should allocate *all* of these stock items to the build
+        """
+        # No build item allocations have been made against the build
+        self.assertEqual(self.build.allocated_stock.count(), 0)
+
+        self.assertFalse(self.build.is_fully_allocated(tracked=False))
+
+        # Stock is not interchangeable, nothing will happen
+        self.build.auto_allocate_stock(interchangeable=False, substitutes=False)
+
+        self.assertFalse(self.build.is_fully_allocated(tracked=False))
+
+        self.assertEqual(self.build.allocated_stock.count(), 0)
+
+        self.assertFalse(self.line_1.is_fully_allocated())
+        self.assertFalse(self.line_2.is_fully_allocated())
+
+        self.assertEqual(self.line_1.unallocated_quantity(), 50)
+        self.assertEqual(self.line_2.unallocated_quantity(), 30)
+
+        # This time we expect stock to be allocated!
+        self.build.auto_allocate_stock(
+            interchangeable=True, substitutes=False, optional_items=True
+        )
+
+        self.assertFalse(self.build.is_fully_allocated(tracked=False))
+
+        self.assertEqual(self.build.allocated_stock.count(), 7)
+
+        self.assertTrue(self.line_1.is_fully_allocated())
+        self.assertFalse(self.line_2.is_fully_allocated())
+
+        self.assertEqual(self.line_1.unallocated_quantity(), 0)
+        self.assertEqual(self.line_2.unallocated_quantity(), 5)
+
+        # This time, allow substitute parts to be used!
+        self.build.auto_allocate_stock(interchangeable=True, substitutes=True)
+
+        self.assertEqual(self.line_1.unallocated_quantity(), 0)
+        self.assertEqual(self.line_2.unallocated_quantity(), 5)
+
+        self.assertTrue(self.line_1.is_fully_allocated())
+        self.assertFalse(self.line_2.is_fully_allocated())
+
+    def test_fully_auto(self):
+        """We should be able to auto-allocate against a build in a single go."""
+        self.build.auto_allocate_stock(
+            interchangeable=True, substitutes=True, optional_items=True
+        )
+
+        self.assertTrue(self.build.is_fully_allocated(tracked=False))
+
+        self.assertEqual(self.line_1.unallocated_quantity(), 0)
+        self.assertEqual(self.line_2.unallocated_quantity(), 0)
+
+    def test_allocate_consumed(self):
+        """Test for auto-allocation against a build which has been fully consumed.
+
+        Steps:
+            1. Fully allocate the build (using the auto-allocate function)
+            2. Consume allocated stock
+            3. Ensure that all allocations are removed
+            4. Re-run the auto-allocate function
+            5. Check that no new allocations have been made
+        """
+        self.assertEqual(self.build.allocated_stock.count(), 0)
+        self.assertFalse(self.build.is_fully_allocated(tracked=False))
+
+        # Auto allocate stock against the build order
+        self.build.auto_allocate_stock(
+            interchangeable=True, substitutes=True, optional_items=True
+        )
+
+        self.assertEqual(self.line_1.allocated_quantity(), 50)
+        self.assertEqual(self.line_2.allocated_quantity(), 30)
+
+        self.assertEqual(self.line_1.unallocated_quantity(), 0)
+        self.assertEqual(self.line_2.unallocated_quantity(), 0)
+
+        self.assertTrue(self.line_1.is_fully_allocated())
+        self.assertTrue(self.line_2.is_fully_allocated())
+
+        self.assertFalse(self.line_1.is_overallocated())
+        self.assertFalse(self.line_2.is_overallocated())
+
+        N = self.build.allocated_stock.count()
+
+        self.assertEqual(self.line_1.allocations.count(), 2)
+        self.assertEqual(self.line_2.allocations.count(), 6)
+
+        self.build.complete_allocations(self.line_1.allocations.all())
+        self.build.complete_allocations(self.line_2.allocations.all())
+
+        self.line_1.refresh_from_db()
+        self.line_2.refresh_from_db()
+
+        self.assertTrue(self.line_1.is_fully_allocated())
+        self.assertTrue(self.line_2.is_fully_allocated())
+        self.assertFalse(self.line_1.is_overallocated())
+        self.assertFalse(self.line_2.is_overallocated())
+
+        self.assertEqual(self.line_1.allocations.count(), 0)
+        self.assertEqual(self.line_2.allocations.count(), 0)
+
+        self.assertEqual(self.line_1.quantity, self.line_1.consumed)
+        self.assertEqual(self.line_2.quantity, self.line_2.consumed)
+
+        # Check that the "allocations" have been removed
+        self.assertEqual(self.build.allocated_stock.count(), N - 8)
+
+        # Now, try to auto-allocate again
+        self.build.auto_allocate_stock(
+            interchangeable=True, substitutes=True, optional_items=True
+        )
+
+        # Ensure that there are no "new" allocations (there should be none!)
+        self.assertEqual(self.line_1.allocated_quantity(), 0)
+        self.assertEqual(self.line_2.allocated_quantity(), 0)
+
+        self.assertEqual(self.line_1.unallocated_quantity(), 0)
+        self.assertEqual(self.line_2.unallocated_quantity(), 0)
+
+        self.assertEqual(self.build.allocated_stock.count(), N - 8)
+
+    def test_consumable_via_part(self):
+        """A BOM line should be treated as consumable if the underlying part is consumable.
+
+        Even though 'bom_item_1' itself is not marked as consumable, marking
+        'sub_part_1' as consumable should have the same effect as marking the
+        BOM line itself as consumable.
+        """
+        self.sub_part_1.consumable = True
+        self.sub_part_1.save()
+
+        self.assertFalse(self.bom_item_1.consumable)
+        self.assertTrue(self.bom_item_1.is_consumable)
+
+        # The BuildLine should be treated as fully allocated, without any stock allocated
+        self.assertEqual(self.line_1.allocated_quantity(), 0)
+        self.assertTrue(self.line_1.is_fully_allocated())
+
+        # The build should not consider this line when checking for unallocated lines
+        unallocated_lines = self.build.unallocated_lines(tracked=False)
+        self.assertNotIn(self.line_1, unallocated_lines)
+
+        # Auto-allocation should skip this line, even though stock exists
+        self.build.auto_allocate_stock(
+            interchangeable=True, substitutes=True, optional_items=True
+        )
+
+        self.assertEqual(self.line_1.allocated_quantity(), 0)
+        self.assertEqual(BuildItem.objects.filter(build_line=self.line_1).count(), 0)
+
+        # The other (non-consumable) line should still be allocated as normal
+        self.assertEqual(self.line_2.allocated_quantity(), 30)
+
+
+class ExternalBuildTest(InvenTreeAPITestCase):
+    """Unit tests for external build order functionality."""
+
+    def test_validation(self):
+        """Test validation of external build logic."""
+        part = Part.objects.create(
+            name='Test part',
+            description='A test part',
+            assembly=True,
+            purchaseable=False,
+        )
+
+        # Create a build order
+        # Cannot create an external build for a non-purchaseable part
+        with self.assertRaises(ValidationError) as err:
+            build = Build.objects.create(
+                part=part, title='Test build order', quantity=10, external=True
+            )
+
+            build.clean()
+
+        self.assertIn(
+            'Build orders can only be externally fulfilled for purchaseable parts',
+            str(err.exception.messages),
+        )
+
+    def test_build_requirement(self):
+        """Test the global 'BUILDORDER_EXTERNAL_REQUIRED' setting."""
+        # Create required test data
+        part = Part.objects.create(
+            name='Test part',
+            description='A test part',
+            assembly=True,
+            purchaseable=True,
+        )
+        supplier = company.models.Company.objects.create(
+            name='Test supplier', active=True, is_supplier=True
+        )
+        supplier_part = company.models.SupplierPart.objects.create(
+            part=part, supplier=supplier, SKU='TEST-123'
+        )
+
+        po = PurchaseOrder.objects.create(supplier=supplier, reference='PO-9999')
+        po_line = PurchaseOrderLineItem.objects.create(
+            order=po, part=supplier_part, quantity=10
+        )
+
+        set_global_setting('BUILDORDER_EXTERNAL_REQUIRED', False)
+        po_line.clean()  # Should not raise an error
+
+        set_global_setting('BUILDORDER_EXTERNAL_BUILDS', True)
+        set_global_setting('BUILDORDER_EXTERNAL_REQUIRED', True)
+
+        # Expect failure, there is no linked build order
+        with self.assertRaises(ValidationError):
+            po_line.clean()
+
+        # Create and link a build order
+        build = Build.objects.create(
+            part=part, title='Test build order', quantity=10, external=True
+        )
+        po_line.build_order = build
+        po_line.save()
+
+        # Clean step now passes
+        po_line.clean()
+
+    def test_logic(self):
+        """Test external build logic."""
+        # Create a purchaseable assembly part
+        assembly = Part.objects.create(
+            name='Test assembly',
+            description='A test assembly',
+            purchaseable=True,
+            assembly=True,
+            active=True,
+        )
+
+        # Create a supplier part
+        supplier = company.models.Company.objects.create(
+            name='Test supplier', active=True, is_supplier=True
+        )
+
+        supplier_part = company.models.SupplierPart.objects.create(
+            part=assembly, supplier=supplier, SKU='TEST-123'
+        )
+
+        # Create a build order against the assembly
+        build = Build.objects.create(
+            part=assembly, title='Test build order', quantity=10, external=True
+        )
+
+        # Order some parts
+        po = PurchaseOrder.objects.create(supplier=supplier, reference='PO-9999')
+
+        # Create a line item to fulfil the build order
+        po_line = PurchaseOrderLineItem.objects.create(
+            order=po, part=supplier_part, quantity=10, build_order=build
+        )
+
+        # Validate starting conditions
+        self.assertEqual(build.quantity, 10)
+        self.assertEqual(build.completed, 0)
+        self.assertEqual(build.build_outputs.count(), 0)
+        self.assertEqual(build.consumed_stock.count(), 0)
+
+        # PLACE the order
+        po.place_order()
+
+        location = StockLocation.objects.first()
+
+        # Receive half the items against the purchase order
+        po.receive_line_item(po_line, location, 5, self.user)
+
+        # As the order was incomplete, the build output has been marked as "building"
+        self.assertEqual(build.quantity, 10)
+        self.assertEqual(build.completed, 0)
+        self.assertEqual(build.build_outputs.count(), 1)
+
+        output = build.build_outputs.first()
+        self.assertTrue(output.is_building)
+
+        build.complete_build_output(output, self.user)
+        build.refresh_from_db()
+        self.assertEqual(build.completed, 5)
+
+        output.refresh_from_db()
+        self.assertFalse(output.is_building)
+
+        # Mark the build order as completed
+        build.complete_build(self.user)
+
+        # The status is updated by the (synchronous, in tests) background task
+        build.refresh_from_db()
+        self.assertEqual(build.status, BuildStatus.COMPLETE)
+
+        # Receive the rest of the line item
+        po.receive_line_item(po_line, location, 5, self.user)
+        po_line.refresh_from_db()
+        self.assertEqual(po_line.received, 10)
+
+        build.refresh_from_db()
+        self.assertEqual(build.completed, 10)
+        self.assertEqual(build.build_outputs.count(), 2)
+
+        # As the build was already completed, output has been marked as "complete" too
+        output = build.build_outputs.order_by('-pk').first()
+        self.assertFalse(output.is_building)
+
+    def test_api_filter(self):
+        """Test that the 'external' API filter works as expected."""
+        self.assignRole('build.view')
+
+        # Create a purchaseable assembly part
+        assembly = Part.objects.create(
+            name='Test assembly',
+            description='A test assembly',
+            purchaseable=True,
+            assembly=True,
+            active=True,
+        )
+
+        # Create some build orders
+        for i in range(5):
+            Build.objects.create(
+                part=assembly,
+                title=f'Test build order {i}',
+                quantity=10,
+                external=i % 2 == 0,
+            )
+
+        url = reverse('api-build-list')
+
+        response = self.get(url)
+
+        self.assertEqual(len(response.data), 5)
+
+        # Filter by 'external'
+        response = self.get(url, {'external': 'true'})
+        self.assertEqual(len(response.data), 3)
+
+        # Filter by 'not external'
+        response = self.get(url, {'external': 'false'})
+        self.assertEqual(len(response.data), 2)
+
+
+class BuildTaskTests(BuildTestBase):
+    """Direct unit tests for the background task functions in build/tasks.py.
+
+    These tests call task functions directly (synchronously) to verify the
+    business logic they encapsulate, independently of the API and offload mechanism.
+    """
+
+    def setUp(self):
+        """Create a stock location available to all task tests."""
+        super().setUp()
+        self.location = StockLocation.objects.create(name='Task Test Location')
+
+    def allocate_stock(self, output, allocations):
+        """Create BuildItem allocations against self.build for the given output."""
+        items_to_create = []
+        for item, quantity in allocations.items():
+            line = BuildLine.objects.filter(
+                build=self.build, bom_item__sub_part=item.part
+            ).first()
+            items_to_create.append(
+                BuildItem(
+                    build_line=line,
+                    stock_item=item,
+                    quantity=quantity,
+                    install_into=output,
+                )
+            )
+        BuildItem.objects.bulk_create(items_to_create)
+
+    def _setup_complete_build(self):
+        """Helper: allocate stock fully and complete all outputs so the build is ready to complete."""
+        self.stock_1_1.quantity = 1000
+        self.stock_1_1.save()
+        self.stock_2_1.quantity = 30
+        self.stock_2_1.save()
+
+        self.build.issue_build()
+
+        # Allocate untracked parts
+        self.allocate_stock(
+            None, {self.stock_1_1: 50, self.stock_1_2: 10, self.stock_2_1: 30}
+        )
+        # Allocate tracked parts to each output
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+        self.allocate_stock(self.output_2, {self.stock_3_1: 14})
+
+        self.build.complete_build_output(self.output_1, None)
+        self.build.complete_build_output(self.output_2, None)
+
+    def test_complete_build_task_is_idempotent(self):
+        """A duplicated completion task run must be a no-op.
+
+        Regression test: the completion task had no build lock and no status
+        re-check, so a redelivered (or double-enqueued) task re-ran the
+        completion side effects (duplicate COMPLETED event and notifications).
+        """
+        from build.tasks import complete_build
+
+        self._setup_complete_build()
+        self.build.complete_build(self.user)
+
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.status, BuildStatus.COMPLETE)
+
+        n_consumed = StockItem.objects.filter(consumed_by=self.build).count()
+        n_tracking = StockItemTracking.objects.count()
+
+        # A redelivered task run must skip based on the (locked) database state
+        with mock.patch('build.tasks.trigger_event') as trigger:
+            complete_build(self.build.pk, self.user.pk)
+            trigger.assert_not_called()
+
+        self.assertEqual(
+            StockItem.objects.filter(consumed_by=self.build).count(), n_consumed
+        )
+        self.assertEqual(StockItemTracking.objects.count(), n_tracking)
+
+    def test_allocate_stock_merges_quantities(self):
+        """Repeated allocations against the same (line, stock item) accumulate.
+
+        Regression test: allocate_stock() never added merged BuildItems to its
+        'to_update' set, so allocating against an existing allocation silently
+        discarded the requested quantity. Duplicate entries within a single
+        request also overwrote (rather than summed) each other.
+        """
+        self.build.issue_build()
+
+        items = [
+            {'build_line': self.line_1, 'stock_item': self.stock_1_2, 'quantity': 10}
+        ]
+
+        self.build.allocate_stock(items)
+
+        alloc = BuildItem.objects.get(build_line=self.line_1, stock_item=self.stock_1_2)
+        self.assertEqual(alloc.quantity, 10)
+
+        # A second allocation against the same (line, stock item) merges quantities
+        self.build.allocate_stock(items)
+
+        alloc.refresh_from_db()
+        self.assertEqual(alloc.quantity, 20)
+
+        # Duplicate entries within a single request are also merged
+        self.build.allocate_stock([
+            {'build_line': self.line_1, 'stock_item': self.stock_1_1, 'quantity': 1},
+            {'build_line': self.line_1, 'stock_item': self.stock_1_1, 'quantity': 2},
+        ])
+
+        alloc = BuildItem.objects.get(build_line=self.line_1, stock_item=self.stock_1_1)
+        self.assertEqual(alloc.quantity, 3)
+
+    # -----------------------------------------------------------------------
+    # complete_build_outputs / scrap_build_outputs tasks
+    # -----------------------------------------------------------------------
+
+    def test_complete_outputs_task_is_idempotent(self):
+        """Duplicate execution of the output completion task must not double-count.
+
+        Regression test: the task never re-checked 'is_building', so a duplicated
+        (or redelivered) task run completed the same outputs twice - inflating the
+        'completed' count for the build order and duplicating stock history.
+        """
+        self.build.issue_build()
+
+        outputs = [{'output_id': self.output_1.pk}, {'output_id': self.output_2.pk}]
+
+        build.tasks.complete_build_outputs(
+            self.build.pk,
+            outputs,
+            self.location.pk,
+            StockStatus.OK.value,
+            user_id=self.user.pk,
+        )
+
+        self.build.refresh_from_db()
+        self.output_1.refresh_from_db()
+
+        self.assertEqual(self.build.completed, 10)
+        self.assertFalse(self.output_1.is_building)
+
+        n_tracking = StockItemTracking.objects.count()
+
+        # Run the task again (simulating a duplicated / redelivered task)
+        build.tasks.complete_build_outputs(
+            self.build.pk,
+            outputs,
+            self.location.pk,
+            StockStatus.OK.value,
+            user_id=self.user.pk,
+        )
+
+        # The 'completed' count has not been double-counted,
+        # and no additional stock history has been generated
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.completed, 10)
+        self.assertEqual(StockItemTracking.objects.count(), n_tracking)
+
+    def test_complete_output_twice_rejected(self):
+        """Completing or scrapping an already-completed output must be rejected.
+
+        Regression test: neither complete_build_output() nor scrap_build_output()
+        re-checked the 'is_building' state of the output.
+        """
+        self.build.issue_build()
+
+        self.build.complete_build_output(self.output_1, None)
+
+        with self.assertRaises(ValidationError):
+            self.build.complete_build_output(self.output_1, None)
+
+        with self.assertRaises(ValidationError):
+            self.build.scrap_build_output(self.output_1, None, self.location)
+
+        # An output belonging to a *different* build order is also rejected
+        with self.assertRaises(ValidationError):
+            self.build.complete_build_output(self.stockitem_wo_required_test, None)
+
+    # -----------------------------------------------------------------------
+    # cancel_build task
+    # -----------------------------------------------------------------------
+
+    def test_cancel_task_discards_allocations(self):
+        """cancel_build with remove_allocated_stock=False: allocations deleted, stock not consumed."""
+        self.build.issue_build()
+        self.allocate_stock(None, {self.stock_1_2: 50})
+        self.assertGreater(self.build.allocated_stock.count(), 0)
+
+        build.tasks.cancel_build(
+            self.build.pk, self.user.pk, remove_allocated_stock=False
+        )
+
+        # BuildItem rows gone
+        self.assertEqual(self.build.allocated_stock.count(), 0)
+        # Stock item was NOT consumed
+        self.assertIsNone(StockItem.objects.get(pk=self.stock_1_2.pk).consumed_by)
+
+    def test_cancel_task_consumes_allocations(self):
+        """cancel_build with remove_allocated_stock=True: stock items are marked consumed."""
+        self.build.issue_build()
+        self.allocate_stock(None, {self.stock_1_2: 50})
+
+        build.tasks.cancel_build(
+            self.build.pk, self.user.pk, remove_allocated_stock=True
+        )
+
+        # All BuildItem rows gone
+        self.assertEqual(self.build.allocated_stock.count(), 0)
+        # The allocated (non-trackable) stock was consumed
+        self.assertGreater(self.build.consumed_stock.count(), 0)
+
+    def test_cancel_task_removes_incomplete_outputs(self):
+        """cancel_build with remove_incomplete_outputs=True: in-progress outputs are deleted."""
+        self.build.issue_build()
+        initial_count = self.build.build_outputs.filter(is_building=True).count()
+        self.assertGreater(initial_count, 0)
+
+        build.tasks.cancel_build(
+            self.build.pk, self.user.pk, remove_incomplete_outputs=True
+        )
+
+        self.assertEqual(self.build.build_outputs.filter(is_building=True).count(), 0)
+
+    def test_cancel_task_preserves_incomplete_outputs(self):
+        """cancel_build with remove_incomplete_outputs=False: in-progress outputs are kept."""
+        self.build.issue_build()
+        initial_count = self.build.build_outputs.filter(is_building=True).count()
+        self.assertGreater(initial_count, 0)
+
+        build.tasks.cancel_build(
+            self.build.pk, self.user.pk, remove_incomplete_outputs=False
+        )
+
+        self.assertEqual(
+            self.build.build_outputs.filter(is_building=True).count(), initial_count
+        )
+
+    # -----------------------------------------------------------------------
+    # complete_build task
+    # -----------------------------------------------------------------------
+
+    @override_settings(
+        TESTING_TABLE_EVENTS=True,
+        PLUGIN_TESTING_EVENTS=True,
+        PLUGIN_TESTING_EVENTS_ASYNC=True,
+    )
+    def test_complete_build_task_triggers_event(self):
+        """complete_build task fires the BuildEvents.COMPLETED event."""
+        from django_q.models import OrmQ
+
+        from build.events import BuildEvents
+
+        set_global_setting('ENABLE_PLUGINS_EVENTS', True)
+        OrmQ.objects.all().delete()
+
+        self._setup_complete_build()
+        self.build.complete_build(self.user)
+
+        task = findOffloadedEvent(BuildEvents.COMPLETED, matching_kwargs=['id'])
+        self.assertIsNotNone(task)
+        self.assertEqual(task.kwargs()['id'], self.build.pk)
+
+        set_global_setting('ENABLE_PLUGINS_EVENTS', False)
+
+    def test_complete_build_task_trim_stock(self):
+        """complete_build with trim_allocated_stock=True removes over-allocations before consuming."""
+        self.stock_1_2.quantity = 100
+        self.stock_1_2.save()
+        self.stock_2_1.quantity = 30
+        self.stock_2_1.save()
+
+        self.build.issue_build()
+
+        # Over-allocate sub_part_1: need 50, allocate 100
+        self.allocate_stock(None, {self.stock_1_2: 100, self.stock_2_1: 30})
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+        self.allocate_stock(self.output_2, {self.stock_3_1: 14})
+
+        self.assertTrue(self.build.is_overallocated())
+
+        self.build.complete_build_output(self.output_1, None)
+        self.build.complete_build_output(self.output_2, None)
+        self.assertTrue(self.build.can_complete)
+
+        self.build.complete_build(self.user, trim_allocated_stock=True)
+        self.build.refresh_from_db()
+        self.assertEqual(self.build.status, BuildStatus.COMPLETE)
+
+        # Only 50 units of sub_part_1 should have been consumed (not 100)
+        consumed_qty = StockItem.objects.filter(
+            consumed_by=self.build, part=self.sub_part_1
+        ).aggregate(total=Sum('quantity'))['total']
+        self.assertEqual(consumed_qty, 50)
+
+    # -----------------------------------------------------------------------
+    # delete_build_outputs task
+    # -----------------------------------------------------------------------
+
+    def test_delete_build_outputs_skips_missing_id(self):
+        """delete_build_outputs silently skips nonexistent output IDs and deletes valid ones."""
+        from build.tasks import delete_build_outputs
+
+        # Create an output directly to avoid serial-number requirements on the trackable assembly
+        output = StockItem.objects.create(
+            part=self.assembly, quantity=3, is_building=True, build=self.build
+        )
+        real_id = output.pk
+
+        # Mix a valid ID with a nonexistent one — must not raise
+        delete_build_outputs(self.build.pk, [real_id, 99999])
+
+        self.assertFalse(StockItem.objects.filter(pk=real_id).exists())
+
+    # -----------------------------------------------------------------------
+    # scrap_build_outputs task
+    # -----------------------------------------------------------------------
+
+    def test_scrap_build_outputs_discard_allocations(self):
+        """scrap_build_outputs with discard_allocations=True removes allocations without consuming stock."""
+        from build.tasks import scrap_build_outputs
+
+        self.build.issue_build()
+        # Allocate tracked stock to output_1
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+        self.assertGreater(self.output_1.items_to_install.count(), 0)
+
+        scrap_build_outputs(
+            self.build.pk,
+            [{'output_id': self.output_1.pk, 'quantity': self.output_1.quantity}],
+            location_id=self.location.pk,
+            notes='discard test',
+            discard_allocations=True,
+            user_id=None,
+        )
+
+        self.output_1.refresh_from_db()
+        self.assertEqual(self.output_1.status, StockStatus.REJECTED.value)
+        self.assertFalse(self.output_1.is_building)
+
+        # Allocation rows should be gone
+        self.assertEqual(self.output_1.items_to_install.count(), 0)
+        # Stock was discarded (not consumed or installed)
+        self.stock_3_1.refresh_from_db()
+        self.assertIsNone(self.stock_3_1.consumed_by)
+        self.assertIsNone(self.stock_3_1.belongs_to)
+
+    def test_scrap_build_outputs_consume_allocations(self):
+        """scrap_build_outputs with discard_allocations=False (default) consumes/installs stock."""
+        from build.tasks import scrap_build_outputs
+
+        self.build.issue_build()
+        self.allocate_stock(self.output_1, {self.stock_3_1: 6})
+
+        scrap_build_outputs(
+            self.build.pk,
+            [{'output_id': self.output_1.pk, 'quantity': self.output_1.quantity}],
+            location_id=self.location.pk,
+            notes='consume test',
+            discard_allocations=False,
+            user_id=None,
+        )
+
+        self.output_1.refresh_from_db()
+        self.assertEqual(self.output_1.status, StockStatus.REJECTED.value)
+        self.assertFalse(self.output_1.is_building)
+
+        # complete_allocation splits stock_3_1 and installs the split piece into output_1
+        # (stock_3_1 quantity=1000, only 6 allocated, so a child item is created)
+        self.assertTrue(
+            StockItem.objects.filter(belongs_to=self.output_1).exists(),
+            'Expected a tracked stock item to be installed into the output',
+        )
+
+    # -----------------------------------------------------------------------
+    # complete_build_outputs task
+    # -----------------------------------------------------------------------
+
+    def test_complete_build_outputs_with_status_none(self):
+        """complete_build_outputs with status=None falls back to StockStatus.OK in the model."""
+        from build.tasks import complete_build_outputs
+
+        self.build.issue_build()
+        # Create output directly to avoid serial-number requirements on the trackable assembly
+        output = StockItem.objects.create(
+            part=self.assembly, quantity=5, is_building=True, build=self.build
+        )
+
+        complete_build_outputs(
+            self.build.pk,
+            [{'output_id': output.pk}],
+            location_id=self.location.pk,
+            status=None,
+            notes='status none test',
+            user_id=None,
+        )
+
+        output.refresh_from_db()
+        self.assertFalse(output.is_building)
+        # status=None should resolve to StockStatus.OK (the model default)
+        self.assertEqual(output.status, StockStatus.OK.value)
+
+
+@skipUnlessDBFeature('has_select_for_update')
+class BuildTrimAllocatedStockConcurrencyTest(TransactionTestCase):
+    """Genuine cross-transaction regression test for Build.trim_allocated_stock().
+
+    Uses two real threads (each with its own database connection) to reproduce
+    an actual overlapping-transaction race, rather than the "stale in-memory
+    instance" trick used elsewhere - trim_allocated_stock() always re-queries the
+    BuildItem rows fresh, so a stale Python object cannot reproduce this bug.
+    """
+
+    fixtures = ['users']
+
+    def setUp(self):
+        """Create a minimal build/allocation setup for the concurrency test."""
+        super().setUp()
+
+        self.user = get_user_model().objects.get(pk=1)
+
+        self.assembly = Part.objects.create(
+            name='Concurrency assembly',
+            description='Assembly for trim_allocated_stock concurrency test',
+            assembly=True,
+        )
+        self.sub_part = Part.objects.create(
+            name='Concurrency component',
+            description='Component for trim_allocated_stock concurrency test',
+            component=True,
+        )
+
+        BomItem.objects.create(part=self.assembly, sub_part=self.sub_part, quantity=1)
+
+        self.build = Build.objects.create(
+            reference=generate_next_build_reference(),
+            part=self.assembly,
+            quantity=1,
+            issued_by=self.user,
+        )
+
+        self.build_line = BuildLine.objects.get(build=self.build)
+
+        self.stock_item = StockItem.objects.create(part=self.sub_part, quantity=100)
+
+        # Over-allocate: only 1 is required, but 10 have been allocated
+        self.build_item = BuildItem.objects.create(
+            build_line=self.build_line, stock_item=self.stock_item, quantity=10
+        )
+
+    def test_trim_allocated_stock_does_not_lose_concurrent_allocation(self):
+        """trim_allocated_stock() must not lose a concurrent allocation update.
+
+        Regression test: BuildItem rows were read via a plain (unlocked) queryset,
+        reduced in Python, and written back with bulk_update(). A concurrent request
+        that increased the same BuildItem's quantity (e.g. a new allocation, which
+        locks the row via select_for_update while saving - see
+        BuildAllocationSerializer) could commit in between the read and the write,
+        and would be silently discarded by the stale trim calculation. The
+        BuildItem rows are now locked (select_for_update) before being read, so
+        the trim always operates on the latest committed quantity.
+        """
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+        errors = []
+
+        def concurrent_allocation_increase():
+            """Simulate a second request increasing the allocation.
+
+            Holds a row-level lock on the BuildItem (as the real allocation
+            endpoint does) until told to proceed, so the trim thread below is
+            forced to block on the same row.
+            """
+            try:
+                with transaction.atomic():
+                    item = BuildItem.objects.select_for_update().get(
+                        pk=self.build_item.pk
+                    )
+                    lock_acquired.set()
+                    release_lock.wait(timeout=5)
+                    item.quantity += 5
+                    item.save()
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        def run_trim():
+            try:
+                self.build.trim_allocated_stock()
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        alloc_thread = threading.Thread(target=concurrent_allocation_increase)
+        alloc_thread.start()
+
+        # Wait until the other thread holds the row lock
+        self.assertTrue(lock_acquired.wait(timeout=5))
+
+        trim_thread = threading.Thread(target=run_trim)
+        trim_thread.start()
+
+        # Give the trim thread a moment to reach (and block on) the row lock
+        time.sleep(0.5)
+
+        # Release the lock - the concurrent allocation increase commits first
+        release_lock.set()
+
+        alloc_thread.join(timeout=5)
+        trim_thread.join(timeout=5)
+
+        self.assertFalse(alloc_thread.is_alive())
+        self.assertFalse(trim_thread.is_alive())
+        self.assertEqual(errors, [])
+
+        self.build_item.refresh_from_db()
+
+        # The concurrent increase (+5, giving 15) must not have been lost: the
+        # trim reduces by 9 (10 originally allocated - 1 actually needed) from
+        # whatever is actually committed, leaving 15 - 9 = 6. A lost update
+        # would instead leave 15 (the trim's reduction discarded) or 1 (the
+        # concurrent increase discarded).
+        self.assertEqual(self.build_item.quantity, 6)
+
+
+@skipUnlessDBFeature('has_select_for_update')
+class BuildSubtractAllocatedStockConcurrencyTest(TransactionTestCase):
+    """Genuine cross-transaction regression test for Build.complete_outstanding_allocations().
+
+    Uses two real threads (each with its own database connection) to reproduce
+    duplicated/overlapping execution - e.g. a redelivered 'complete_build' or
+    'cancel_build' background task - which cannot be reproduced with a single
+    stale Python instance, since this method always re-queries the BuildItem
+    rows fresh.
+    """
+
+    fixtures = ['users']
+
+    def setUp(self):
+        """Create a minimal build/allocation setup for the concurrency test."""
+        super().setUp()
+
+        self.user = get_user_model().objects.get(pk=1)
+
+        self.assembly = Part.objects.create(
+            name='Concurrency assembly 2',
+            description='Assembly for subtract_allocated_stock concurrency test',
+            assembly=True,
+        )
+        self.sub_part = Part.objects.create(
+            name='Concurrency component 2',
+            description='Component for subtract_allocated_stock concurrency test',
+            component=True,
+        )
+
+        BomItem.objects.create(part=self.assembly, sub_part=self.sub_part, quantity=1)
+
+        self.build = Build.objects.create(
+            reference=generate_next_build_reference(),
+            part=self.assembly,
+            quantity=1,
+            issued_by=self.user,
+        )
+
+        self.build_line = BuildLine.objects.get(build=self.build)
+
+        self.stock_item = StockItem.objects.create(part=self.sub_part, quantity=10)
+
+        self.build_item = BuildItem.objects.create(
+            build_line=self.build_line, stock_item=self.stock_item, quantity=10
+        )
+
+    def test_subtract_allocated_stock_is_not_processed_twice(self):
+        """A duplicated/concurrent call to complete_outstanding_allocations() must not double-consume.
+
+        Regression test: BuildItem allocation rows were read via a plain (unlocked)
+        queryset before being consumed and deleted. Two overlapping calls to this
+        method (e.g. a redelivered completion/cancellation background task) could
+        each read the same still-existing allocation and both call
+        complete_allocation() on it - double-counting the BuildLine's 'consumed'
+        quantity. The BuildItem rows are now locked (select_for_update) before
+        being processed, so a duplicate call finds nothing left to do.
+        """
+        start_barrier = threading.Barrier(2, timeout=5)
+        errors = []
+
+        def run_subtract():
+            try:
+                start_barrier.wait()
+                self.build.complete_outstanding_allocations(self.user)
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        thread_a = threading.Thread(target=run_subtract)
+        thread_b = threading.Thread(target=run_subtract)
+
+        thread_a.start()
+        thread_b.start()
+
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+
+        self.assertFalse(thread_a.is_alive())
+        self.assertFalse(thread_b.is_alive())
+        self.assertEqual(errors, [])
+
+        self.build_line.refresh_from_db()
+
+        # The allocation must only have been consumed once, no matter which
+        # thread "won" the race for the row lock
+        self.assertEqual(self.build_line.consumed, 10)
+        self.assertFalse(BuildItem.objects.filter(pk=self.build_item.pk).exists())
+
+
+@skipUnlessDBFeature('has_select_for_update')
+class BuildAllocateStockConcurrencyTest(TransactionTestCase):
+    """Genuine cross-transaction regression test for Build.allocate_stock().
+
+    Uses two real threads (each with its own database connection) to reproduce
+    the reported race: two concurrent allocation requests, against two
+    different Builds but the *same* StockItem, could each read the item's
+    unallocated quantity before either had committed, and both create a
+    BuildItem for the full quantity - over-allocating the StockItem. Because
+    the requests target different Builds, the pre-existing Build-row lock
+    does not serialize them.
+
+    allocate_stock() now locks the referenced StockItem (select_for_update,
+    via StockItem.lock_quantity()) and re-validates the unallocated quantity
+    under that lock before writing, so only one of two concurrent
+    full-quantity allocation requests against a shared StockItem may succeed.
+    """
+
+    fixtures = ['users']
+
+    def setUp(self):
+        """Create two Builds which both require the same shared StockItem."""
+        super().setUp()
+
+        self.user = get_user_model().objects.get(pk=1)
+
+        self.assembly_a = Part.objects.create(
+            name='Concurrency assembly A',
+            description='Assembly for allocate_stock concurrency test',
+            assembly=True,
+        )
+        self.assembly_b = Part.objects.create(
+            name='Concurrency assembly B',
+            description='Assembly for allocate_stock concurrency test',
+            assembly=True,
+        )
+        self.sub_part = Part.objects.create(
+            name='Shared concurrency component',
+            description='Component for allocate_stock concurrency test',
+            component=True,
+        )
+
+        BomItem.objects.create(part=self.assembly_a, sub_part=self.sub_part, quantity=1)
+        BomItem.objects.create(part=self.assembly_b, sub_part=self.sub_part, quantity=1)
+
+        self.build_a = Build.objects.create(
+            reference=generate_next_build_reference(),
+            part=self.assembly_a,
+            quantity=1,
+            issued_by=self.user,
+        )
+        self.build_b = Build.objects.create(
+            reference=generate_next_build_reference(),
+            part=self.assembly_b,
+            quantity=1,
+            issued_by=self.user,
+        )
+
+        self.build_line_a = BuildLine.objects.get(build=self.build_a)
+        self.build_line_b = BuildLine.objects.get(build=self.build_b)
+
+        # Only enough stock for *one* of the two full-quantity allocations below
+        self.stock_item = StockItem.objects.create(part=self.sub_part, quantity=5)
+
+    def test_concurrent_allocation_does_not_over_allocate(self):
+        """Two concurrent full-quantity allocation requests must not both succeed."""
+        start_barrier = threading.Barrier(2, timeout=5)
+        errors = []
+        results = []
+
+        # Wrap StockItem.lock_quantity() so both threads reach the (real,
+        # database-level) row lock at the same time - one wins the lock and
+        # proceeds, the other blocks until the winner's transaction completes.
+        original_lock_quantity = StockItem.lock_quantity
+
+        def synced_lock_quantity(self_item):
+            start_barrier.wait(timeout=5)
+            return original_lock_quantity(self_item)
+
+        def allocate(build, build_line):
+            try:
+                build.allocate_stock([
+                    {
+                        'build_line': build_line,
+                        'stock_item': self.stock_item,
+                        'quantity': 5,
+                    }
+                ])
+                results.append('ok')
+            except ValidationError:
+                results.append('rejected')
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        thread_a = threading.Thread(
+            target=allocate, args=(self.build_a, self.build_line_a)
+        )
+        thread_b = threading.Thread(
+            target=allocate, args=(self.build_b, self.build_line_b)
+        )
+
+        with mock.patch.object(StockItem, 'lock_quantity', synced_lock_quantity):
+            thread_a.start()
+            thread_b.start()
+
+            thread_a.join(timeout=5)
+            thread_b.join(timeout=5)
+
+        self.assertFalse(thread_a.is_alive())
+        self.assertFalse(thread_b.is_alive())
+        self.assertEqual(errors, [])
+
+        # Exactly one request must have been rejected as over-allocating
+        self.assertEqual(sorted(results), ['ok', 'rejected'])
+
+        total_allocated = (
+            BuildItem.objects.filter(stock_item=self.stock_item).aggregate(
+                q=Sum('quantity')
+            )['q']
+            or 0
+        )
+
+        self.assertEqual(total_allocated, 5)
+        self.assertLessEqual(total_allocated, self.stock_item.quantity)

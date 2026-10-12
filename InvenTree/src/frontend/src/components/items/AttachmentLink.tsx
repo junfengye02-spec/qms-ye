@@ -1,0 +1,104 @@
+import { Anchor, Group } from '@mantine/core';
+import {
+  IconFile,
+  IconFileTypeCsv,
+  IconFileTypeDoc,
+  IconFileTypePdf,
+  IconFileTypeXls,
+  IconFileTypeZip,
+  IconFileUnknown,
+  IconLink,
+  IconPhoto
+} from '@tabler/icons-react';
+import { type ReactNode, useMemo } from 'react';
+import { generateUrl } from '../../functions/urls';
+import { Thumbnail } from '../images/Thumbnail';
+
+/**
+ * Return an icon based on the provided filename
+ */
+export function attachmentIcon(attachment: string): ReactNode {
+  const sz = 18;
+
+  if (!attachment) {
+    return <IconFileUnknown size={sz} />;
+  }
+
+  const suffix = attachment.split('.').pop()?.toLowerCase() ?? '';
+  switch (suffix) {
+    case 'pdf':
+      return <IconFileTypePdf size={sz} />;
+    case 'csv':
+      return <IconFileTypeCsv size={sz} />;
+    case 'xls':
+    case 'xlsx':
+      return <IconFileTypeXls size={sz} />;
+    case 'doc':
+    case 'docx':
+      return <IconFileTypeDoc size={sz} />;
+    case 'zip':
+    case 'tar':
+    case 'gz':
+    case '7z':
+      return <IconFileTypeZip size={sz} />;
+    case 'png':
+    case 'jpg':
+    case 'jpeg':
+    case 'gif':
+    case 'bmp':
+    case 'tif':
+    case 'webp':
+      return <IconPhoto size={sz} />;
+    default:
+      return <IconFile size={sz} />;
+  }
+}
+
+/**
+ * Render a link to a file attachment, with icon and text
+ * @param attachment : string - The attachment filename
+ */
+export function AttachmentLink({
+  attachment,
+  thumbnail,
+  external
+}: Readonly<{
+  attachment: string;
+  thumbnail?: string;
+  external?: boolean;
+}>): ReactNode {
+  const url = useMemo(() => {
+    if (external) {
+      return attachment;
+    }
+
+    return generateUrl(attachment);
+  }, [attachment, external]);
+
+  const text: string = useMemo(() => {
+    if (!attachment) {
+      return '-';
+    }
+
+    return external ? attachment : (attachment.split('/').pop() ?? '-');
+  }, [attachment, external]);
+
+  return (
+    <Group justify='left' gap='sm' wrap='nowrap'>
+      {thumbnail ? (
+        <Thumbnail src={thumbnail} hover size={16} />
+      ) : external ? (
+        <IconLink />
+      ) : (
+        attachmentIcon(attachment)
+      )}
+      {!!attachment ? (
+        <Anchor href={url} target='_blank' rel='noopener noreferrer'>
+          {text}
+        </Anchor>
+      ) : (
+        text
+      )}
+    </Group>
+  );
+}

@@ -1,0 +1,1185 @@
+"""Unit testing for the various report models."""
+
+import os
+import socket
+import tempfile
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
+
+from django.apps import apps
+from django.conf import settings
+from django.core.cache import cache
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.test import TestCase
+from django.urls import reverse
+
+from pypdf import PdfReader
+
+import report.models as report_models
+from build.models import Build
+from common.models import Attachment
+from common.settings import set_global_setting
+from InvenTree.config import get_base_dir
+from InvenTree.unit_test import AdminTestCase, InvenTreeAPITestCase
+from order.models import PurchaseOrder, ReturnOrder, SalesOrder
+from part.models import Part
+from plugin.registry import registry
+from report.models import LabelTemplate, ReportTemplate
+from stock.models import StockItem
+
+
+class ReportTest(InvenTreeAPITestCase):
+    """Base class for unit testing reporting models."""
+
+    fixtures = [
+        'category',
+        'part',
+        'company',
+        'location',
+        'test_templates',
+        'supplier_part',
+        'stock',
+        'stock_tests',
+        'bom',
+        'build',
+        'order',
+        'return_order',
+        'sales_order',
+    ]
+
+    superuser = True
+
+    def setUp(self):
+        """Ensure cache is cleared as part of test setup."""
+        cache.clear()
+
+        apps.get_app_config('report').create_default_reports()
+
+        return super().setUp()
+
+    def test_list_endpoint(self):
+        """Test that the LIST endpoint works for each report."""
+        url = reverse('api-report-template-list')
+
+        response = self.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        reports = ReportTemplate.objects.all()
+
+        n = len(reports)
+        # API endpoint must return correct number of reports
+        self.assertEqual(len(response.data), n)
+
+        # Filter by "enabled" status
+        response = self.get(url, {'enabled': True})
+        self.assertEqual(len(response.data), n)
+
+        response = self.get(url, {'enabled': False})
+        self.assertEqual(len(response.data), 0)
+
+        # Disable each report
+        for report in reports:
+            report.enabled = False
+            report.save()
+
+        # Filter by "enabled" status
+        response = self.get(url, {'enabled': True})
+        self.assertEqual(len(response.data), 0)
+
+        response = self.get(url, {'enabled': False})
+        self.assertEqual(len(response.data), n)
+
+        # Filter by items
+        part_pk = Part.objects.first().pk
+        report = ReportTemplate.objects.filter(model_type='part').first()
+        assert report
+
+        try:
+            response = self.get(
+                url, {'model_type': 'part', 'items': part_pk}, expected_code=400
+            )
+            self.assertIn('model_type', response.data)
+            self.assertIn(
+                'Select a valid choice. part is not one of the available choices.',
+                str(response.data),
+            )
+            return  # pragma: no cover
+        except AssertionError:
+            response = self.get(url, {'model_type': 'part', 'items': part_pk})
+
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['pk'], report.pk)
+        self.assertEqual(response.data[0]['name'], report.name)
+
+    def test_create_endpoint(self):
+        """Test that creating a new report works for each report."""
+        url = reverse('api-report-template-list')
+
+        # Create a new report
+        # Django REST API "APITestCase" does not work like requests - to send a file without it existing on disk,
+        # create it as a StringIO object, and upload it under parameter template
+        filestr = StringIO(
+            '{% extends "label/report_base.html" %}{% block content %}<pre>TEST REPORT</pre>{% endblock content %}'
+        )
+        filestr.name = 'ExampleTemplate.html'
+
+        data = {
+            'name': 'New report',
+            'description': 'A fancy new report created through API test',
+            'template': filestr,
+            'model_type': 'part2',
+        }
+
+        # Test with invalid model type
+        response = self.post(url, data=data, expected_code=400)
+
+        self.assertIn('"part2" is not a valid choice', str(response.data['model_type']))
+
+        # With valid model type
+        data['model_type'] = 'part'
+        filestr.seek(0)
+
+        response = self.post(url, data=data, format=None, expected_code=201)
+
+        # Make sure the expected keys are in the response
+        self.assertIn('pk', response.data)
+        self.assertIn('name', response.data)
+        self.assertIn('description', response.data)
+        self.assertIn('template', response.data)
+        self.assertIn('filters', response.data)
+        self.assertIn('enabled', response.data)
+
+        self.assertEqual(response.data['name'], 'New report')
+        self.assertEqual(
+            response.data['description'], 'A fancy new report created through API test'
+        )
+        self.assertTrue(response.data['template'].endswith('ExampleTemplate.html'))
+
+    def test_detail_endpoint(self):
+        """Test that the DETAIL endpoint works for each report."""
+        reports = ReportTemplate.objects.all()
+
+        n = len(reports)
+
+        # Make sure at least one report defined
+        self.assertGreaterEqual(n, 1)
+
+        # Check detail page for first report
+        response = self.get(
+            reverse('api-report-template-detail', kwargs={'pk': reports[0].pk}),
+            expected_code=200,
+        )
+
+        # Make sure the expected keys are in the response
+        self.assertIn('pk', response.data)
+        self.assertIn('name', response.data)
+        self.assertIn('description', response.data)
+        self.assertIn('template', response.data)
+        self.assertIn('filters', response.data)
+        self.assertIn('enabled', response.data)
+
+        filestr = StringIO(
+            '{% extends "label/report_base.html" %}{% block content %}<pre>TEST REPORT VERSION 2</pre>{% endblock content %}'
+        )
+        filestr.name = 'ExampleTemplate_Updated.html'
+
+        # Check PATCH method
+        response = self.patch(
+            reverse('api-report-template-detail', kwargs={'pk': reports[0].pk}),
+            {
+                'name': 'Changed name during test',
+                'description': 'New version of the template',
+                'template': filestr,
+            },
+            format=None,
+            expected_code=200,
+        )
+
+        # Make sure the expected keys are in the response
+        self.assertIn('pk', response.data)
+        self.assertIn('name', response.data)
+        self.assertIn('description', response.data)
+        self.assertIn('template', response.data)
+        self.assertIn('filters', response.data)
+        self.assertIn('enabled', response.data)
+
+        self.assertEqual(response.data['name'], 'Changed name during test')
+        self.assertEqual(response.data['description'], 'New version of the template')
+
+        self.assertTrue(
+            response.data['template'].endswith('ExampleTemplate_Updated.html')
+        )
+
+        # Delete the last report
+        response = self.delete(
+            reverse('api-report-template-detail', kwargs={'pk': reports[n - 1].pk}),
+            expected_code=204,
+        )
+
+    def test_metadata(self):
+        """Unit tests for the metadata field."""
+        p = ReportTemplate.objects.first()
+
+        self.assertEqual(p.metadata, {})
+
+        self.assertIsNone(p.get_metadata('test'))
+        self.assertEqual(p.get_metadata('test', backup_value=123), 123)
+
+        # Test update via the set_metadata() method
+        p.set_metadata('test', 3)
+        self.assertEqual(p.get_metadata('test'), 3)
+
+        for k in ['apple', 'banana', 'carrot', 'carrot', 'banana']:
+            p.set_metadata(k, k)
+
+        self.assertEqual(len(p.metadata.keys()), 4)
+
+    def test_report_template_permissions(self):
+        """Test that the user permissions are correctly applied.
+
+        - For all /api/report/ endpoints, any authenticated user should have full read access
+        - Write access is limited to staff users
+        - Non authenticated users should have no access at all
+        """
+        # First test the "report list" endpoint
+        url = reverse('api-report-template-list')
+
+        template = ReportTemplate.objects.first()
+        assert template
+
+        detail_url = reverse('api-report-template-detail', kwargs={'pk': template.pk})
+
+        # Non-authenticated user should have no access
+        self.logout()
+
+        self.get(url, expected_code=401)
+
+        # Authenticated user should have read access
+        self.user.is_staff = False
+        self.user.save()
+
+        self.login()
+
+        # Check read access to template list URL
+        self.get(url, expected_code=200)
+
+        # Check read access to template detail URL
+        self.get(detail_url, expected_code=200)
+
+        # An update to the report template should fail
+        self.patch(
+            detail_url,
+            data={'description': 'Some new description here?'},
+            expected_code=403,
+        )
+
+        # Now, test with a staff user
+        self.logout()
+
+        self.user.is_staff = True
+        self.user.save()
+
+        self.login()
+
+        self.patch(
+            detail_url,
+            data={'description': 'An updated description'},
+            expected_code=200,
+        )
+
+        template.refresh_from_db()
+        self.assertEqual(template.description, 'An updated description')
+
+    def test_print(self):
+        """Test that we can print a report manually."""
+        # Find a suitable report template
+        template = ReportTemplate.objects.filter(
+            enabled=True, model_type='stockitem'
+        ).first()
+
+        # Gather some items
+        items = StockItem.objects.all()[0:5]
+
+        output = template.print(items)
+
+        self.assertTrue(output.complete)
+        self.assertEqual(output.total, 5)
+        self.assertIsNotNone(output.output)
+        self.assertTrue(output.output.name.endswith('.pdf'))
+
+    def test_print_custom_template(self):
+        """Create a new template, print it, and check the output."""
+        template_string = """
+        Hello {{ user.username }}
+        Your user ID is {{ user.pk }}.
+        Template name: {{ template.name }}
+        {% if merge %}
+        REPORT OUTPUT: MERGE = ENABLED
+        {% for instance in instances %}
+        Part Name: {{ instance.part.name }}
+        Stock ID: {{ instance.stock_item.pk }}
+        {% endfor %}
+        {% else %}
+        REPORT OUTPUT: MERGE = DISABLED
+        Part Name: {{ part.name }}
+        Stock ID: {{ stock_item.pk }}
+        {% endif %}
+        """
+
+        template_file = ContentFile(
+            template_string.encode('utf-8'), name='TestPrintTemplate.html'
+        )
+
+        # Create a new report template with the above string as the template
+        template = ReportTemplate.objects.create(
+            name='Test report template',
+            model_type='stockitem',
+            template=template_file,
+            filename_pattern='unit_test_report.pdf',
+        )
+
+        item = StockItem.objects.first()
+
+        test_strings = [
+            f'Hello {self.user.username}',
+            f'Your user ID is {self.user.pk}.',
+            f'Template name: {template.name}',
+            f'Part Name: {item.part.name}',
+            f'Stock ID: {item.pk}',
+        ]
+
+        url = reverse('api-report-print')
+        post_data = {'template': template.pk, 'items': [item.pk]}
+
+        # Test with "debug" both enabled and disabled
+        for debug in [True, False]:
+            set_global_setting('REPORT_DEBUG_MODE', debug)
+
+            # Test with "merge" both enabled and disabled
+            for merge in [True, False]:
+                template.merge = merge
+                template.save()
+
+                # Generate report via the API
+                data = self.post(url, data=post_data).data
+
+                self.assertEqual(data['user'], self.user.pk)
+                self.assertIsNotNone(data['output'])
+                self.assertTrue(data['output'].endswith('.html' if debug else '.pdf'))
+                self.assertIn('unit_test_report', data['output'])
+
+                if debug:
+                    # Read raw HTML file
+                    output = default_storage.open(
+                        data['output'].replace('/media/', '', 1)
+                    )
+                    file_content = str(output.read(), 'utf-8')
+                else:
+                    # Convert from PDF bytes to string for testing purposes
+                    output_path = os.path.join(
+                        settings.MEDIA_ROOT, data['output'].replace('/media/', '', 1)
+                    )
+                    reader = PdfReader(output_path)
+                    file_content = ''.join(page.extract_text() for page in reader.pages)
+
+                # Replace any newline characters for testing purposes
+                file_content = file_content.replace('\n', ' ')
+
+                for ts in test_strings:
+                    self.assertIn(ts, file_content)
+
+                self.assertIn(
+                    f'REPORT OUTPUT: MERGE = {"ENABLED" if merge else "DISABLED"}',
+                    file_content,
+                )
+
+
+class LabelTest(InvenTreeAPITestCase):
+    """Unit tests for label templates."""
+
+    fixtures = [
+        'category',
+        'part',
+        'company',
+        'location',
+        'test_templates',
+        'supplier_part',
+        'stock',
+        'stock_tests',
+        'bom',
+        'build',
+        'order',
+        'return_order',
+        'sales_order',
+    ]
+
+    superuser = True
+
+    def setUp(self):
+        """Ensure cache is cleared as part of test setup."""
+        cache.clear()
+
+        apps.get_app_config('report').create_default_labels()
+
+        return super().setUp()
+
+    def test_print(self):
+        """Test manual printing of label templates."""
+        # Find a suitable label template
+        template = LabelTemplate.objects.filter(enabled=True, model_type='part').first()
+
+        # Gather some items
+        parts = Part.objects.all()[0:10]
+
+        # Find the label plugin (render to pdf)
+        plugin = registry.get_plugin('inventreelabel')
+
+        self.assertIsNotNone(template)
+        self.assertIsNotNone(plugin)
+
+        output = template.print(items=parts, plugin=plugin)
+
+        self.assertTrue(output.complete)
+        self.assertEqual(output.total, 10)
+        self.assertIsNotNone(output.output)
+        self.assertEqual(output.plugin, 'inventreelabel')
+        self.assertTrue(output.output.name.endswith('.pdf'))
+
+    def test_print_custom_template(self):
+        """Test printing against a custom template file."""
+        template_string = """
+        Hello {{ user.username }} - your user ID is {{ user.pk }}.
+        Template name: {{ template.name }}
+        Barcode: {{ qr_data }}
+        Location ID: {{ location.pk }}
+        Base URL: {{ base_url }}
+        """
+
+        template_file = ContentFile(
+            template_string.encode('utf-8'), name='TestLabelTemplate.html'
+        )
+
+        # Create a new label template with the above string as the template
+        template = LabelTemplate.objects.create(
+            name='Test label template',
+            model_type='stocklocation',
+            template=template_file,
+            filename_pattern='unit_test_label.pdf',
+        )
+
+        location = StockItem.objects.exclude(location=None).first().location
+
+        url = reverse('api-label-print')
+        post_data = {'template': template.pk, 'items': [location.pk]}
+
+        plugin = registry.get_plugin('inventreelabel')
+
+        test_strings = [
+            f'Hello {self.user.username} - your user ID is {self.user.pk}.',
+            f'Template name: {template.name}',
+            f'Location ID: {location.pk}',
+            f'INV-SL{location.pk}',
+        ]
+
+        # Test with "debug" both enabled and disabled
+        for debug in [True, False]:
+            plugin.set_setting('DEBUG', debug)
+
+            # Generate label via the API
+            data = self.post(url, data=post_data).data
+
+            self.assertEqual(data['user'], self.user.pk)
+            self.assertTrue(data['output'].endswith('.html' if debug else '.pdf'))
+
+            # Read the file contents back out, and validate
+            if debug:
+                # Read raw HTML file
+                output = default_storage.open(data['output'].replace('/media/', '', 1))
+                file_content = str(output.read(), 'utf-8')
+            else:
+                # Convert from PDF bytes to string for testing purposes
+                output_path = os.path.join(
+                    settings.MEDIA_ROOT, data['output'].replace('/media/', '', 1)
+                )
+                reader = PdfReader(output_path)
+                file_content = ''.join(page.extract_text() for page in reader.pages)
+
+            # Replace any newline for testing purposes
+            file_content = file_content.replace('\n', ' ')
+
+            for ts in test_strings:
+                self.assertIn(ts, file_content)
+
+    def test_filters(self):
+        """Test that template filters are correctly validated."""
+        from django.core.exceptions import ValidationError
+
+        from InvenTree.helpers import validateFilterString
+
+        invalid = [
+            'name=widget, category=6, invalid_field=123',
+            'category__in=[1,',
+            'foo=bar',
+        ]
+
+        valid = [
+            'name=widget, category=6',
+            'category__in=[1,2,3]',
+            'name=widget  , id__in  =    [99, 199        ]   ',
+            'pk__in=[1,2,3], active=True',
+            'pk__in=[1, 99], category__in=[1,2,3]',
+        ]
+
+        template = LabelTemplate.objects.filter(enabled=True, model_type='part').first()
+
+        for f in invalid:
+            with self.assertRaises(ValidationError):
+                template.filters = f
+                template.clean()
+
+        for f in valid:
+            template.filters = f
+            template.clean()
+
+        # Test a specific example
+        example = '    location__in =[1,2 , 3 ] , status= 3  , id__in=[4,5,6]  , part__active=False'
+
+        result = validateFilterString(example, model=StockItem)
+
+        self.assertEqual(result['location__in'], [1, 2, 3])
+        self.assertEqual(result['status'], '3')
+        self.assertEqual(result['id__in'], [4, 5, 6])
+        self.assertEqual(result['part__active'], 'False')
+
+
+class PrintTestMixins:
+    """Mixin that enables e2e printing tests."""
+
+    plugin_ref = 'samplelabelprinter'
+
+    def do_activate_plugin(self):
+        """Activate the 'samplelabel' plugin."""
+        registry.set_plugin_state(self.plugin_ref, True)
+        plugin = registry.get_plugin(self.plugin_ref)
+        self.assertIsNotNone(plugin)
+
+    def run_print_test(self, qs, model_type, label: bool = True):
+        """Run tests on single and multiple page printing.
+
+        Args:
+            qs: class of the base queryset
+            model_type: the model type of the queryset
+            label: whether the model is a label or report
+        """
+        mdl = LabelTemplate if label else ReportTemplate
+        url = reverse('api-label-print' if label else 'api-report-print')
+
+        qs = qs.objects.all()
+        template = mdl.objects.filter(enabled=True, model_type=model_type).first()
+        assert template
+        plugin = registry.get_plugin(self.plugin_ref)
+
+        # Single page printing
+        self.post(
+            url,
+            {'template': template.pk, 'plugin': plugin.pk, 'items': [qs[0].pk]},
+            expected_code=201,
+        )
+
+        # Multi page printing
+        self.post(
+            url,
+            {
+                'template': template.pk,
+                'plugin': plugin.pk,
+                'items': [item.pk for item in qs],
+            },
+            expected_code=201,
+            max_query_time=15,
+            max_query_count=150 * len(qs),
+        )
+
+        # Test with wrong dimensions
+        if not hasattr(template, 'width'):
+            return
+
+        org_width = template.width
+        template.width = 0
+        template.save()
+        response = self.post(
+            url,
+            {'template': template.pk, 'plugin': plugin.pk, 'items': [qs[0].pk]},
+            expected_code=400,
+        )
+        self.assertEqual(str(response.data['template'][0]), 'Invalid label dimensions')
+        template.width = org_width
+        template.save()
+
+
+class TestReportTest(PrintTestMixins, ReportTest):
+    """Unit testing class for the stock item TestReport model."""
+
+    model = report_models.ReportTemplate
+
+    list_url = 'api-report-template-list'
+    detail_url = 'api-report-template-detail'
+    print_url = 'api-report-print'
+
+    def setUp(self):
+        """Setup function for the stock item TestReport."""
+        apps.get_app_config('report').create_default_reports()
+        self.do_activate_plugin()
+
+        return super().setUp()
+
+    def test_print(self):
+        """Printing tests for the TestReport."""
+        template = ReportTemplate.objects.filter(
+            enabled=True, model_type='stockitem'
+        ).first()
+        assert template
+
+        self.assertIsNotNone(template)
+
+        # Ensure that the 'attach_to_model' attribute is initially False
+        template.attach_to_model = False
+        template.save()
+        template.refresh_from_db()
+
+        self.assertFalse(template.attach_to_model)
+
+        url = reverse(self.print_url)
+
+        # Try to print without providing a valid StockItem
+        self.post(url, {'template': template.pk}, expected_code=400)
+
+        # Try to print with an invalid StockItem
+        self.post(url, {'template': template.pk, 'items': [9999]}, expected_code=400)
+
+        # Now print with a valid StockItem
+        item = StockItem.objects.first()
+
+        n = item.attachments.count()
+
+        response = self.post(
+            url, {'template': template.pk, 'items': [item.pk]}, expected_code=201
+        )
+
+        # There should be a link to the generated PDF
+        self.assertTrue(response.data['output'].startswith('/media/data_output/'))
+        self.assertTrue(response.data['output'].endswith('.pdf'))
+
+        # By default, this should *not* have created an attachment against this stockitem
+        self.assertEqual(n, item.attachments.count())
+        self.assertFalse(
+            Attachment.objects.filter(model_id=item.pk, model_type='stockitem').exists()
+        )
+
+        # Now try again, but attach the generated PDF to the StockItem
+        template.attach_to_model = True
+        template.save()
+
+        response = self.post(
+            url, {'template': template.pk, 'items': [item.pk]}, expected_code=201
+        )
+
+        # A new attachment should have been created
+        self.assertEqual(n + 1, item.attachments.count())
+        attachment = item.attachments.order_by('-pk').first()
+
+        # The attachment should be a PDF
+        self.assertTrue(attachment.attachment.name.endswith('.pdf'))
+
+        # Set DEBUG_MODE to return the report as an HTML file
+        set_global_setting('REPORT_DEBUG_MODE', True)
+
+        # Grab the report template
+        template_merge = ReportTemplate.objects.filter(
+            enabled=True, model_type='stockitem', merge=True
+        ).first()
+
+        # Grab the first 3 stock items
+        items = StockItem.objects.all()[:3]
+        response = self.post(
+            url,
+            {'template': template_merge.pk, 'items': [item.pk for item in items]},
+            expected_code=201,
+        )
+
+        # Open and read the output HTML as a string
+        html_report = ''
+        report_path = os.path.join(
+            settings.MEDIA_ROOT, response.data['output'].replace('/media/', '', 1)
+        )
+        self.assertTrue(response.data['output'])
+        with open(report_path, encoding='utf-8') as f:
+            html_report = f.read()
+
+        # Assuming the number of <head> and <body> correlates to the number of pages
+        # in the generated PDF
+        self.assertEqual(html_report.count('<head>'), 1)
+        self.assertEqual(html_report.count('<body>'), 1)
+
+    def test_mdl_build(self):
+        """Test the Build model."""
+        self.run_print_test(Build, 'build', label=False)
+
+    def test_mdl_returnorder(self):
+        """Test the ReturnOrder model."""
+        self.run_print_test(ReturnOrder, 'returnorder', label=False)
+
+    def test_mdl_salesorder(self):
+        """Test the SalesOrder model."""
+        for enabled in [True, False]:
+            set_global_setting('REPORT_DEBUG_MODE', enabled)
+            self.run_print_test(SalesOrder, 'salesorder', label=False)
+
+
+class ReportPrintPermissionTest(InvenTreeAPITestCase):
+    """Test that the report print endpoint checks VIEW permission on the associated model type."""
+
+    fixtures = [
+        'category',
+        'part',
+        'company',
+        'location',
+        'supplier_part',
+        'stock',
+        'order',
+    ]
+
+    superuser = False
+    roles = []
+
+    def setUp(self):
+        """Setup for permission tests."""
+        cache.clear()
+        apps.get_app_config('report').create_default_reports()
+        return super().setUp()
+
+    def test_report_print_model_permission(self):
+        """A user without VIEW permission on the model type must receive 403; granting the role allows printing."""
+        template = ReportTemplate.objects.filter(
+            enabled=True, model_type='purchaseorder'
+        ).first()
+        self.assertIsNotNone(template)
+
+        items = PurchaseOrder.objects.all()[:2]
+        self.assertGreater(len(items), 0)
+
+        url = reverse('api-report-print')
+        post_data = {'template': template.pk, 'items': [item.pk for item in items]}
+
+        # No roles assigned: expect permission denied
+        self.post(url, data=post_data, expected_code=403)
+
+        # Grant view access to purchase orders
+        self.assignRole('purchase_order.view')
+        cache.clear()
+
+        # Should now succeed
+        self.post(url, data=post_data, expected_code=201)
+
+    def test_report_print_disabled_template(self):
+        """Printing against a disabled report template must be rejected."""
+        self.assignRole('purchase_order.view')
+        cache.clear()
+
+        template = ReportTemplate.objects.filter(
+            enabled=True, model_type='purchaseorder'
+        ).first()
+        self.assertIsNotNone(template)
+
+        items = PurchaseOrder.objects.all()[:2]
+        self.assertGreater(len(items), 0)
+
+        url = reverse('api-report-print')
+        post_data = {'template': template.pk, 'items': [item.pk for item in items]}
+
+        # Enabled template: should succeed
+        self.post(url, data=post_data, expected_code=201)
+
+        # Disable the template and retry: should be rejected
+        template.enabled = False
+        template.save()
+
+        self.post(url, data=post_data, expected_code=400)
+
+
+class LabelPrintPermissionTest(InvenTreeAPITestCase):
+    """Test that the label print endpoint checks VIEW permission on the associated model type."""
+
+    fixtures = ['category', 'part', 'company', 'location', 'supplier_part', 'stock']
+
+    superuser = False
+    roles = []
+
+    def setUp(self):
+        """Setup for permission tests."""
+        cache.clear()
+        apps.get_app_config('report').create_default_labels()
+        return super().setUp()
+
+    def test_label_print_model_permission(self):
+        """A user without VIEW permission on the model type must receive 403; granting the role allows printing."""
+        template = LabelTemplate.objects.filter(enabled=True, model_type='part').first()
+        self.assertIsNotNone(template)
+        self.assertGreater(template.width, 0)
+        self.assertGreater(template.height, 0)
+
+        items = Part.objects.all()[:2]
+        self.assertGreater(len(items), 0)
+
+        url = reverse('api-label-print')
+        post_data = {'template': template.pk, 'items': [item.pk for item in items]}
+
+        # No roles assigned: expect permission denied
+        self.post(url, data=post_data, expected_code=403)
+
+        # Grant view access to parts
+        self.assignRole('part.view')
+        cache.clear()
+
+        # Should now succeed
+        self.post(url, data=post_data, expected_code=201)
+
+    def test_label_print_disabled_template(self):
+        """Printing against a disabled label template must be rejected."""
+        self.assignRole('part.view')
+        cache.clear()
+
+        template = LabelTemplate.objects.filter(enabled=True, model_type='part').first()
+        self.assertIsNotNone(template)
+        self.assertGreater(template.width, 0)
+        self.assertGreater(template.height, 0)
+
+        items = Part.objects.all()[:2]
+        self.assertGreater(len(items), 0)
+
+        url = reverse('api-label-print')
+        post_data = {'template': template.pk, 'items': [item.pk for item in items]}
+
+        # Enabled template: should succeed
+        self.post(url, data=post_data, expected_code=201)
+
+        # Disable the template and retry: should be rejected
+        template.enabled = False
+        template.save()
+
+        self.post(url, data=post_data, expected_code=400)
+
+
+class AdminTest(AdminTestCase):
+    """Tests for the admin interface integration."""
+
+    def test_admin(self):
+        """Test the admin URL."""
+        self.helper(model=ReportTemplate)
+
+
+class URLFetcherE2ETest(ReportTest):
+    """End-to-end test: the URL fetcher blocks malicious URLs during a real PDF render.
+
+    Extends ReportTest so that fixtures, auth, and default report templates are all
+    available.  The print task runs synchronously in test mode (no workers), so the
+    render completes inline and log output is captured within the same request.
+    """
+
+    def test_file_url_blocked_in_render(self):
+        """A template embedding a file:// URL must still produce a PDF, but the URL must be blocked and logged."""
+        from io import StringIO
+
+        # Upload a minimal report template that embeds a malicious file:// reference.
+        html = (
+            '<html><body>'
+            '<img src="file:///etc/passwd">'
+            '<p>Security test content</p>'
+            '</body></html>'
+        )
+        template_io = StringIO(html)
+        template_io.name = 'security_test_template.html'
+
+        response = self.post(
+            reverse('api-report-template-list'),
+            data={
+                'name': 'Security Test',
+                'description': 'Tests that file:// URLs are blocked during rendering',
+                'template': template_io,
+                'model_type': 'stockitem',
+            },
+            format=None,
+            expected_code=201,
+        )
+        template_pk = response.data['pk']
+
+        item = StockItem.objects.first()
+        self.assertIsNotNone(item)
+
+        # Render the template.  WeasyPrint catches the ValueError from our fetcher and
+        # continues, so the PDF is still generated — the blocked resource is just skipped.
+        with self.assertLogs('inventree', level='WARNING') as captured:
+            response = self.post(
+                reverse('api-report-print'),
+                {'template': template_pk, 'items': [item.pk]},
+                expected_code=201,
+            )
+
+        # A PDF output should have been produced despite the blocked resource.
+        self.assertTrue(response.data['output'].endswith('.pdf'))
+
+        # The fetcher must have logged a warning identifying the blocked URL.
+        blocked_warnings = [
+            msg
+            for msg in captured.output
+            if 'blocked file://' in msg and '/etc/passwd' in msg
+        ]
+        self.assertTrue(
+            blocked_warnings, 'Expected a blocked file:// warning in the log output'
+        )
+
+    def test_ssrf_url_blocked_in_render(self):
+        """A template embedding an HTTP URL to a private/reserved address must be blocked and logged."""
+        from io import StringIO
+
+        # 127.0.0.1 is loopback — validate_url_no_ssrf rejects it regardless of port.
+        html = (
+            '<html><body>'
+            '<img src="http://127.0.0.1/ssrf-probe">'
+            '<p>Security test content</p>'
+            '</body></html>'
+        )
+        template_io = StringIO(html)
+        template_io.name = 'ssrf_test_template.html'
+
+        response = self.post(
+            reverse('api-report-template-list'),
+            data={
+                'name': 'SSRF Test',
+                'description': 'Tests that SSRF URLs are blocked during rendering',
+                'template': template_io,
+                'model_type': 'stockitem',
+            },
+            format=None,
+            expected_code=201,
+        )
+        template_pk = response.data['pk']
+
+        item = StockItem.objects.first()
+        self.assertIsNotNone(item)
+
+        # Render the template.  WeasyPrint catches the ValueError from our fetcher and
+        # continues, so the PDF is still generated — the blocked resource is just skipped.
+        with self.assertLogs('inventree', level='WARNING') as captured:
+            response = self.post(
+                reverse('api-report-print'),
+                {'template': template_pk, 'items': [item.pk]},
+                expected_code=201,
+            )
+
+        # A PDF output should have been produced despite the blocked resource.
+        self.assertTrue(response.data['output'].endswith('.pdf'))
+
+        # The fetcher must have logged a warning for the blocked SSRF attempt.
+        blocked_warnings = [
+            msg
+            for msg in captured.output
+            if 'blocked URL' in msg and '127.0.0.1' in msg
+        ]
+        self.assertTrue(
+            blocked_warnings, 'Expected a blocked SSRF URL warning in the log output'
+        )
+
+    def test_fetch_urls_disabled_blocks_http(self):
+        """When REPORT_FETCH_URLS is False, any http/https URL in a template must be blocked."""
+        from io import StringIO
+
+        from common.settings import set_global_setting
+
+        # Use a publicly routable address so the test would reach the network if
+        # our guard were absent — we want to confirm it is stopped by the setting,
+        # not by a secondary SSRF IP check.
+        html = (
+            '<html><body>'
+            '<img src="https://example.com/image.png">'
+            '<p>Security test content</p>'
+            '</body></html>'
+        )
+        template_io = StringIO(html)
+        template_io.name = 'fetch_disabled_test_template.html'
+
+        response = self.post(
+            reverse('api-report-template-list'),
+            data={
+                'name': 'Fetch Disabled Test',
+                'description': 'Tests that HTTP fetching is blocked when REPORT_FETCH_URLS=False',
+                'template': template_io,
+                'model_type': 'stockitem',
+            },
+            format=None,
+            expected_code=201,
+        )
+        template_pk = response.data['pk']
+
+        item = StockItem.objects.first()
+        self.assertIsNotNone(item)
+
+        set_global_setting('REPORT_FETCH_URLS', False, change_user=None)
+
+        with self.assertLogs('inventree', level='WARNING') as captured:
+            response = self.post(
+                reverse('api-report-print'),
+                {'template': template_pk, 'items': [item.pk]},
+                expected_code=201,
+            )
+
+        self.assertTrue(response.data['output'].endswith('.pdf'))
+
+        blocked_warnings = [
+            msg
+            for msg in captured.output
+            if 'REPORT_FETCH_URLS' in msg and 'example.com' in msg
+        ]
+        self.assertTrue(
+            blocked_warnings, 'Expected a REPORT_FETCH_URLS warning in the log output'
+        )
+
+
+class URLFetcherTest(TestCase):
+    """Tests for InvenTreeURLFetcher security restrictions."""
+
+    def setUp(self):
+        """Import fetcher for each test."""
+        from report.fetcher import InvenTreeURLFetcher
+
+        self.fetcher = InvenTreeURLFetcher()
+
+    def test_file_url_blocked(self):
+        """file:// URLs must always be rejected regardless of path."""
+        for url in [
+            'file:///etc/passwd',
+            'file:///proc/self/environ',
+            f'file://{settings.MEDIA_ROOT}/report/assets/anything.png',
+            f'file://{settings.STATIC_ROOT}/some/font.ttf',
+        ]:
+            with self.assertRaises(ValueError, msg=f'Expected block for {url}'):
+                self.fetcher.fetch(url)
+
+    def test_unknown_scheme_blocked(self):
+        """Non-http/data/file schemes must be rejected."""
+        for url in ['ftp://example.com/file.txt', 'javascript://x']:
+            with self.assertRaises(ValueError, msg=f'Expected block for {url}'):
+                self.fetcher.fetch(url)
+
+    def test_data_uri_allowed(self):
+        """data: URIs must always be permitted."""
+        with patch('weasyprint.urls.URLFetcher.fetch', return_value={}):
+            self.fetcher.fetch('data:image/png;base64,abc123')
+            self.fetcher.fetch('data:text/css;base64,abc123')
+
+    def test_dns_rebind_is_blocked_at_fetch_time(self):
+        """A hostname that resolves safely for validation but privately for the real fetch must be blocked.
+
+        Regression test: `validate_url_no_ssrf()` used to resolve the hostname once,
+        validate that result, and then discard it, so `InvenTreeURLFetcher.fetch()`
+        would delegate straight to WeasyPrint's own fetcher, which resolves the
+        hostname *again* independently. An attacker controlling DNS for their own
+        domain could answer the first ("check") lookup with a public IP and every
+        subsequent ("use") lookup with a private/internal one (DNS rebinding), so the
+        real request WeasyPrint made went somewhere the validator never saw.
+        """
+        set_global_setting('REPORT_FETCH_URLS', True, change_user=None)
+
+        public_addrinfo = [(2, 1, 6, '', ('93.184.216.34', 0))]
+        private_addrinfo = [(2, 1, 6, '', ('127.0.0.1', 0))]
+
+        calls = {'n': 0}
+
+        def rebinding_getaddrinfo(host, *args, **kwargs):
+            calls['n'] += 1
+            return public_addrinfo if calls['n'] == 1 else private_addrinfo
+
+        def fake_weasyprint_fetch(_self, url, headers=None):
+            # Simulate WeasyPrint's own fetch-time DNS resolution, performed
+            # independently of the validation InvenTreeURLFetcher already did.
+            socket.getaddrinfo('rebind.example.com', None)
+            return {'string': b'should never be reached'}
+
+        import InvenTree.helpers_model as helpers_model
+
+        with patch.object(
+            helpers_model, '_real_getaddrinfo', side_effect=rebinding_getaddrinfo
+        ):
+            with patch(
+                'weasyprint.urls.URLFetcher.fetch', side_effect=fake_weasyprint_fetch
+            ):
+                with self.assertRaises(socket.gaierror):
+                    self.fetcher.fetch('http://rebind.example.com/image.png')
+
+        # The validation-time lookup (safe) and the fetch-time lookup (private)
+        # must both have happened for this to be a meaningful regression test.
+        self.assertEqual(calls['n'], 2)
+
+
+class DefaultTemplateFileTest(TestCase):
+    """Unit tests for building the default report and label template files."""
+
+    def test_file_size_matches_bytes(self):
+        """file_from_template must size the ContentFile by byte length.
+
+        Reading the template in text mode makes the size a character count,
+        which is smaller than the byte length for multi-byte content and breaks
+        uploads to S3 backends that enforce Content-Length.
+        """
+        config = apps.get_app_config('report')
+        filename = 'inventree_transfer_order_report.html'
+        content_file = config.file_from_template('report', filename)
+        path = get_base_dir().joinpath('report', 'templates', 'report', filename)
+        self.assertEqual(content_file.size, path.stat().st_size)
+
+    def test_file_from_template_is_encoding_agnostic(self):
+        """file_from_template must preserve the exact bytes for any encoding.
+
+        A text-mode read sizes the ContentFile by character count and needs the
+        correct decoder, so non-English content is both mis-sized and at risk of
+        corruption. Reading the raw bytes keeps the file identical to what is on
+        disk, so the size always matches the Content-Length used for S3 uploads.
+        The samples below cover non-ASCII text in a few encodings, including
+        multi-byte content where a character count would not equal the byte
+        length.
+        """
+        config = apps.get_app_config('report')
+
+        # (encoding, text, whether the encoding uses multi-byte characters).
+        # The utf cases hold characters that span more than one byte, so a
+        # character count would not equal the byte length; latin-1 stays
+        # single-byte and is included to show the read is not utf-8 specific.
+        cases = [
+            ('utf-8', 'Système de café ≤ 你好 в наявності 📦', True),
+            ('utf-16', 'Système de café ≤ 你好 в наявності 📦', True),
+            ('latin-1', 'Système de café àéîõü', False),
+        ]
+
+        for encoding, text, multibyte in cases:
+            with self.subTest(encoding=encoding):
+                body = f'<html><body>{text}</body></html>'
+                raw = body.encode(encoding)
+
+                if multibyte:
+                    # A character count would differ from the byte length here
+                    self.assertNotEqual(len(raw), len(body))
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = Path(tmp)
+                    template_dir = base.joinpath('report', 'templates', 'report')
+                    template_dir.mkdir(parents=True)
+                    filename = f'encoding_{encoding}.html'
+                    template_dir.joinpath(filename).write_bytes(raw)
+
+                    with patch('report.apps.get_base_dir', return_value=base):
+                        content_file = config.file_from_template('report', filename)
+
+                # Size and content must match the raw bytes exactly
+                self.assertEqual(content_file.size, len(raw))
+                self.assertEqual(content_file.read(), raw)

@@ -1,0 +1,220 @@
+# InvenTree UI Components - Changelog
+
+This file contains historical changelog information for the InvenTree UI components library.
+
+### 1.5.0 - August 2026
+
+Updated UI components library to match 1.5.0 InvenTree release.
+
+### 1.4.6 - June 2026
+
+Adds `useInvenTreeHotkeys` hook that mirrors mantine's `useHotkeys` hook, but adds visibility of the hotkeys to the user interface.
+
+### 1.4.5 - June 2026
+
+Fixes callback signature for `<LocalizedComponent>` to allow for an optional `loadLocale` function to be passed in, which is used to dynamically load locale messages for the plugin.
+
+### 1.4.4 - June 2026
+
+Fixes bundling issues associated with the `InventreeHmrPlugin` plugin function.
+
+### 1.4.3 - June 2026
+
+Expose the `InventreeHmrPlugin` on a different path (`@inventreedb/ui/vite`) to avoid vite bundling issues.
+
+### 1.4.2 - June 2026
+
+Fixes a bug in the `LocalizedComponent` function
+
+### 1.4.1 - June 2026
+
+### HMR Support
+
+Adds support for React Fast Refresh in plugin development. This allows for a much smoother development experience when working on UI plugins, as changes to React components will now trigger a component-level update rather than a full page reload.
+
+### Localized Components
+
+Exposes a new `LocalizedComponent` function, which can be used to create React components that are automatically localized using the InvenTree server's localization system.
+
+### 1.4.0 - May 2026
+
+#### Version Numbering
+
+This update brings the version numbering in-line with the core InvenTree server version, which is currently at `1.4.0`. This versioning scheme will be maintained going forward, with the UI components library version matching the core server version.
+
+Thus, version `1.4.x` of the UI components library will be compatible with version `1.4.x` of the InvenTree server, and so on.
+
+#### Mantine Library Update
+
+The underlying Mantine library has been updated from version `8.x` to version `9.x`. This update may introduce breaking changes for plugins that rely on the InvenTree UI components library, as the Mantine library is a core dependency. Plugin developers should test their plugins against this new version to ensure compatibility.
+
+#### New Components
+
+Adds additional functions in the plugin context related to form rendering and API invocation:
+- `useInstance`
+- `renderRemoteInstance`
+- `EditApiForm`
+- `RenderInlineModel`
+- `Thumbnail`
+
+Exposes sub-components related to DetailDrawer rendering:
+- `DetailDrawerComponent`
+- `useLocalLibState`
+
+#### Plugin System
+
+Enable React Fast Refresh support for plugin frontend development. Plugin modules exporting React components must start with a capital letter; otherwise, a full page reload occurs instead of a component-level update.
+
+### 0.11.3 - April 2026
+
+Exposes additional type definitions related to rendering drawers from tables:
+- `DetailDrawer`
+- `TableState`
+
+Also exposes `StylishText`, which is required downstream for rendering the DetailDrawer component, and is used in a number of places within the InvenTree UI.
+
+### 0.11.2 - April 2026
+
+Exposes additional type definitions related to tables and filters:
+
+- TableFilterChoice
+- TableFilterType
+- TableFilter
+- FilterSetState
+
+### 0.11.1 - April 2026
+
+Fixes dependency issues for the `InvenTreeTable` component, which were introduced in `0.11.0`. This ensures that the component works correctly and does not cause issues with plugin builds.
+
+### 0.11.0 - April 2026
+
+Adds the `InvenTreeTable` component, which provides plugins with a method of implementing an API-driven data table which is consistent with the rest of the InvenTree UI. This component supports features such as pagination, sorting, and filtering, and can be used to display data from the InvenTree API in a tabular format.
+
+### 0.10.1 - April 2026
+
+Allows plugins to specify custom model rendering functions within the data import wizard, allowing import of data models not defined in the core InvenTree codebase.
+
+### 0.10.0 - April 2026
+
+Exposes the `importer` object to the plugin context, allow plugins to initialize a data import session using the data importer wizard.
+
+### 0.9.0 - March 2026
+
+Exposes the `useMonitorBackgroundTask` hook, which allows plugins to monitor the status of a background task and display notifications when the task is complete. This is useful for plugins that offload long-running tasks to the background and want to provide feedback to the user when the task is complete.
+
+Renames the `monitorDataOutput` hook to `useMonitorDataOutput` to better reflect the fact that this is a React hook, and to provide a more consistent naming convention for hooks in the library.
+
+### 0.8.2 - March 2026
+
+Bug fixes for the `monitorDataOutput` hook - https://github.com/inventree/InvenTree/pull/11458
+
+### 0.8.0 - March 2026
+
+Exposes the `monitorDataOutput` hook, which allows plugins to monitor the output of a long-running task and display notifications when the task is complete. This is useful for plugins that need to perform long-running tasks and want to provide feedback to the user when the task is complete.
+
+### 0.7.0 - October 2025
+
+Exposes stock adjustment forms to plugins, allowing plugins to adjust stock adjustments using the common InvenTree UI form components.
+
+### 0.6.0 - September 2025
+
+Updated underlying Mantine library versions.
+
+### 0.5.0 - August 2025
+
+This release updates the base `react` major version from `18.3.1` to `19.1.1`. This change may introduce breaking changes for plugins that rely on the InvenTree UI components library (plugin developers should test their plugins against this new version).
+
+Ref: https://github.com/inventree/InvenTree/pull/10202/
+
+### 0.4.0 - July 2025
+
+Externalize React, Lingui and Mantine libraries in the plugin library build step to avoid version conflicts. This ensures that the components provided as part of the @inventreedb/ui package *does not bundle* the React and Mantine libraries, but instead expects them to be provided by the InvenTree server.
+
+This change fixes issues with version mismatches between the InvenTree server and the plugin, allowing plugins to utilize the common components provided by the InvenTree UI components library without conflicts.
+
+*Note: Without this change, the components introduced in `0.3.0` would not work correctly, as they are pre-compiled with a different React instance.*
+
+### New Functions
+
+Adds the following functions to the API:
+
+- `initPlugin`: Initializes the plugin with the provided context
+
+### New UI Components
+
+- `AddItemButton`: A common button component used throughout the InvenTree UI
+
+### New Types
+
+Exposes a number of new internal types related to the API forms interface:
+
+- ApiFormFieldChoice
+- ApiFormFieldHeader
+- ApiFormFieldType
+- ApiFormFieldSet
+- ApiFormProps
+- ApiFormModalProps
+- BulkEditApiFormModalProps
+
+
+## 0.3.0 - July 2025
+
+Introduces new types and functions to enhance the InvenTree UI components API.
+
+### New Types
+
+- `ModelDict`: A dictionary type for InvenTree models, allowing for easier access to model instances.
+
+### New Functions
+
+- `formatCurrencyValue`: A utility function to format currency values consistently across the UI.
+- `formatDecimal`: A utility function to format decimal values, ensuring consistent display of numerical data.
+- `formatFileSize`: A utility function to format file sizes, making it easier to read large numbers.
+
+### New UI Components
+
+- `ActionButton`: A button component build on the Mantine `<Button`> component.
+- `ButtonMenu`: A menu component that provides a dropdown of icon actions.
+- `PassFailButton`: A button component that can be used to indicate pass/fail states, useful for testing or validation scenarios.
+- `YesNoButton`: A button component that provides a simple yes/no choice, useful for confirmation dialogs.
+- `ProgressBar`: A progress bar component that can be used to indicate loading or processing states.
+- `SearchInput`: An input component that provides a search functionality, allowing users to filter data easily.
+- `RowViewAction`: A component that provides a row view action in a table.
+- `RowDuplicateAction`: A component that provides a row duplicate action in a table.
+- `RowEditAction`: A component that provides a row edit action in a table.
+- `RowDeleteAction`: A component that provides a row delete action in a table.
+- `RowCancelAction`: A component that provides a row cancel action in a table.
+- `RowActions`: A component that provides a set of row actions in a table, allowing for multiple actions to be performed on a row.
+
+
+## 0.2.0 - June 2025
+
+- Bug fixes and performance improvements. No major changes introduced in this version.
+
+## 0.1.0 - May 2025
+
+Published the first version of the UI components API. This allows external plugins to hook into the InvenTree user interface, and provides global access to the following objects:
+
+- `window.React`: The core `react` library running on the UI
+- `window.ReactDOM`: The `react-dom` library
+- `window.ReactDOMClient`: The `react-dom/client` library
+- `window.MantineCore`: The `@mantine/core` library
+- `window.MantineNotifications`: The `@mantine/notifications` library
+
+All of these components can be "externalized" in the plugin build step.
+
+### New Types
+
+- `ApiEndpoints`: An object containing the API endpoints for the InvenTree server.
+- `ModelType`: A type representing the available model types in InvenTree.
+- `UserRoles`: An object containing the user roles available in InvenTree.
+- `UserPermissions`: An object containing the user permissions available in InvenTree.
+- `InvenTreePluginContext`: The context object for InvenTree plugins, providing access to the API and other utilities.
+
+### New Functions
+
+- `apiUrl`: Construct an API URL for the InvenTree server.
+- `getBaseUrl`: Get the base URL for the InvenTree server.
+- `getDetailUrl`: Get the detail URL for a specific model type.
+- `navigateToLink`: Navigate to a provided link, either internal or external.
+- `checkPluginVersion`: Check the version of a plugin against the InvenTree server.
